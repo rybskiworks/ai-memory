@@ -263,6 +263,37 @@ fn pi_extension_path_in(
         .join("ai-memory-pi.ts"))
 }
 
+/// `$PRIME_AGENT_CODING_AGENT_DIR/extensions/ai-memory-prime-agent.ts` when the var
+/// is set, else `~/.prime/agent/extensions/ai-memory-prime-agent.ts` — prime-agent
+/// lifecycle + MCP bridge extension.
+///
+/// `PRIME_AGENT_CODING_AGENT_DIR` overrides prime-agent's user config dir
+/// (`~/.prime/agent`), so extensions written to the default path are never
+/// loaded by a prime-agent configured that way: capture silently does
+/// nothing, with a successful-looking install. Project-local
+/// `.prime/agent/extensions/` is prime-agent's own opt-in (see its
+/// extensions.md); this installer targets the user-global location and
+/// `--config-file` covers a project-local write.
+pub(crate) fn prime_extension_path() -> anyhow::Result<std::path::PathBuf> {
+    prime_extension_path_in(std::env::var_os("PRIME_AGENT_CODING_AGENT_DIR"))
+}
+
+/// The env value comes in as a parameter so tests can exercise both branches
+/// without mutating process env (mirrors [`codex_hooks_path_in`]).
+fn prime_extension_path_in(
+    env_override: Option<std::ffi::OsString>,
+) -> anyhow::Result<std::path::PathBuf> {
+    if let Some(dir) = crate::commands::path_util::agent_config_home(env_override) {
+        return Ok(dir.join("extensions").join("ai-memory-prime-agent.ts"));
+    }
+    Ok(home_dir()
+        .context("could not locate $HOME for ~/.prime/agent/extensions")?
+        .join(".prime")
+        .join("agent")
+        .join("extensions")
+        .join("ai-memory-prime-agent.ts"))
+}
+
 /// `$KIMI_CODE_HOME/config.toml` when set, else `~/.kimi-code/config.toml`.
 /// Kimi Code keeps hooks as `[[hooks]]` entries inside the same
 /// config.toml that stores the user's providers/model, so the apply
@@ -383,6 +414,7 @@ pub fn run(config: &Config, mut args: InstallHooksArgs) -> Result<()> {
             | AgentChoice::OpenCode2
             | AgentChoice::Omp
             | AgentChoice::Pi
+            | AgentChoice::PrimeAgent
             | AgentChoice::Openclaw
     );
     if generated || local_hook_policy_v1_supported() {
@@ -455,6 +487,9 @@ pub fn run(config: &Config, mut args: InstallHooksArgs) -> Result<()> {
                 apply_to_opencode2_plugin(&server_url, auth, &args, &capture_mode)
             }
             AgentChoice::Pi => apply_to_pi_extension(&server_url, auth, &args, &capture_mode),
+            AgentChoice::PrimeAgent => {
+                apply_to_prime_extension(&server_url, auth, &args, &capture_mode)
+            }
             AgentChoice::Omp => apply_to_omp_extension(&server_url, auth, &args, &capture_mode),
             AgentChoice::ClaudeCode => {
                 let hooks_dir =
@@ -559,6 +594,9 @@ pub fn run(config: &Config, mut args: InstallHooksArgs) -> Result<()> {
             render_opencode2_plugin(&server_url, auth, strategy, &preview_capture_mode)
         }
         AgentChoice::Pi => render_pi_extension(&server_url, auth, strategy, &preview_capture_mode),
+        AgentChoice::PrimeAgent => {
+            render_prime_extension(&server_url, auth, strategy, &preview_capture_mode)
+        }
         AgentChoice::Omp => render_omp_extension(
             &server_url,
             auth,
@@ -808,6 +846,7 @@ fn existing_agent_config(args: &InstallHooksArgs) -> Option<String> {
             AgentChoice::OpenCode => opencode_plugin_path().ok()?,
             AgentChoice::OpenCode2 => opencode2_plugin_path().ok()?,
             AgentChoice::Pi => pi_extension_path().ok()?,
+            AgentChoice::PrimeAgent => prime_extension_path().ok()?,
             AgentChoice::Omp => omp_extension_path(args.profile.as_deref()).ok()?,
             AgentChoice::Openclaw => openclaw_plugin::default_plugin_dir()
                 .ok()?
@@ -836,12 +875,14 @@ fn baked_project_strategy(agent: AgentChoice, existing: &str) -> Option<ProjectS
         AgentChoice::OpenCode
         | AgentChoice::OpenCode2
         | AgentChoice::Pi
+        | AgentChoice::PrimeAgent
         | AgentChoice::Omp
         | AgentChoice::Openclaw => {
             let marker = match agent {
                 AgentChoice::OpenCode => "--agent opencode --apply`.",
                 AgentChoice::OpenCode2 => "--agent opencode2 --apply`.",
                 AgentChoice::Pi => "--agent pi --apply`.",
+                AgentChoice::PrimeAgent => "--agent prime-agent --apply`.",
                 AgentChoice::Omp => "--agent omp --apply`.",
                 AgentChoice::Openclaw => "--agent openclaw --apply`.",
                 _ => return None,
@@ -1103,6 +1144,11 @@ fn infer_installed_mcp_config(agent: AgentChoice) -> Result<Option<InferredMcpCo
             "url",
         )),
         McpClient::Pi => Ok(None),
+        McpClient::PrimeAgent => Ok(infer_json_mcp_config(
+            &content,
+            &["mcpServers", "ai-memory"],
+            "url",
+        )),
         McpClient::AntigravityCli => Ok(infer_json_mcp_config(
             &content,
             &["mcpServers", "ai-memory"],
@@ -1192,6 +1238,11 @@ fn mcp_client_for_agent(agent: AgentChoice) -> Option<McpClient> {
         // Pi bridges MCP through its generated extension, not a native
         // mcp.json the installer can scrape.
         AgentChoice::Pi => None,
+        // Prime-agent keeps its MCP servers in the user-global settings.json
+        // `mcpServers` map, so an installed entry seeds the hooks
+        // install's server URL. Bearer auth stays flag-driven: the entry
+        // names an env var rather than embedding a literal token.
+        AgentChoice::PrimeAgent => Some(McpClient::PrimeAgent),
         AgentChoice::KiroCli | AgentChoice::KiroCliV3 => Some(McpClient::KiroCli),
         // No first-party Pool MCP installer ships yet, so there is no
         // config file to infer a server URL or token from.
@@ -4013,6 +4064,246 @@ async function bootstrapMcpBridge(pi: any): Promise<void> {
 "#
 }
 
+fn prime_extension_hint_in(env_override: Option<std::ffi::OsString>) -> String {
+    prime_extension_path_in(env_override).map_or_else(
+        |_| "~/.prime/agent/extensions/ai-memory-prime-agent.ts".to_string(),
+        |p| p.display().to_string(),
+    )
+}
+
+fn apply_to_prime_extension(
+    server_url: &str,
+    auth_token: Option<&str>,
+    args: &InstallHooksArgs,
+    capture_mode: &str,
+) -> Result<()> {
+    let path = resolve_prime_extension_path(args)?;
+    let strategy = args.project_strategy.and_then(ProjectStrategyArg::baked);
+    let body = build_prime_agent_extension(server_url, auth_token, strategy, capture_mode);
+
+    let outcome = apply_atomic(&path, move |_existing| Ok(body.clone()))?;
+    println!(
+        "✓ {} {} ({})",
+        outcome.verb(),
+        path.display(),
+        match outcome {
+            ApplyOutcome::Created => "new prime-agent extension file",
+            ApplyOutcome::Updated => "backup written next to it",
+            ApplyOutcome::NoOp => "already up to date",
+        }
+    );
+
+    // No warn_if_agents_share_extensions_dir call: prime-agent resolves under
+    // PRIME_AGENT_CODING_AGENT_DIR / ~/.prime/agent, a directory neither Pi
+    // nor OMP ever writes to, so the shared-directory double-capture the
+    // Pi/OMP warning guards against cannot happen here.
+    remove_legacy_extension(&path, "prime-agent");
+
+    if !matches!(outcome, ApplyOutcome::NoOp) {
+        println!();
+        println!(
+            "prime-agent loads TypeScript extensions from ~/.prime/agent/extensions/ on next start."
+        );
+        println!("Restart prime-agent for lifecycle capture and MCP tools to take effect.");
+    }
+    Ok(())
+}
+
+fn render_prime_extension(
+    server_url: &str,
+    auth_token: Option<&str>,
+    project_strategy: Option<&str>,
+    capture_mode: &str,
+) -> Result<()> {
+    println!(
+        "// prime-agent extension — write to {}",
+        prime_extension_hint_in(std::env::var_os("PRIME_AGENT_CODING_AGENT_DIR"))
+    );
+    println!("// Or re-run with `--apply` to install it automatically.");
+    println!(
+        "// Restart prime-agent after changing extensions; MCP tools are bridged by this file."
+    );
+    println!("// A project-local `.prime/agent/extensions/` copy is prime-agent's own opt-in;");
+    println!("// pass it via `--config-file` to target that location instead.");
+    println!();
+    println!(
+        "{}",
+        build_prime_agent_extension(server_url, auth_token, project_strategy, capture_mode)
+    );
+    Ok(())
+}
+
+fn resolve_prime_extension_path(args: &InstallHooksArgs) -> Result<PathBuf> {
+    if let Some(p) = &args.config_file {
+        return Ok(p.clone());
+    }
+    prime_extension_path()
+}
+
+/// prime-agent lifecycle + MCP bridge extension.
+///
+/// Port of [`build_pi_extension`]: prime-agent inherits Pi's extension host
+/// (`pi.on(...)`, `pi.registerTool`, `ctx.sessionManager`), so the shared
+/// capture prelude (marker walk, capture-policy v1, bounded queue + spool,
+/// runtime token resolution, MCP bridge) is reused verbatim with the agent
+/// constant swapped. Event mapping: `session_start` → `session-start`,
+/// `before_agent_start` → handoff fetch, `tool_call` → `pre-tool-use`,
+/// `tool_result` → `post-tool-use`, `session_shutdown` → `session-end`,
+/// `session_before_compact`/`session_compact` → `pre-compact`.
+///
+/// prime-agent's refinement lifecycle (`session_before_refine`,
+/// `refine_complete`) has no canonical hook event, so those two ride the
+/// tolerant extension channel
+/// (`?event=other&extension=prime-agent&source_event=<name>`) pending a canonical
+/// enum decision.
+fn build_prime_agent_extension(
+    server_url: &str,
+    auth_token: Option<&str>,
+    project_strategy: Option<&str>,
+    capture_mode: &str,
+) -> String {
+    let lifecycle = build_omp_extension(server_url, auth_token, project_strategy, capture_mode)
+        .replace(
+            "install-hooks --agent omp --apply",
+            "install-hooks --agent prime-agent --apply",
+        )
+        .replace("const AGENT = \"omp\";", "const AGENT = \"prime-agent\";")
+        .replace(
+            r#"
+  api.on("session.compacting", (_event: any, ctx: any) => {
+    postPreCompact(ctx);
+  });
+"#,
+            "\n",
+        )
+        .replace(
+            "export default function AiMemoryExtension(api: any): void {",
+            &format!(
+                "{}\nexport default function AiMemoryExtension(pi: any): void {{\n  try {{ void bootstrapMcpBridge(pi); }} catch (_e) {{}}",
+                prime_mcp_bridge_source()
+            ),
+        )
+        .replace("api.on(\"", "pi.on(\"")
+        .replace(
+            "async function fetchHandoff(",
+            &format!("{PRIME_EXTENSION_HOOK_SOURCE}\n\nasync function fetchHandoff("),
+        )
+        .replace(
+            "    postHook(\"session-end\", sessionPayload(ctx));\n  });\n}",
+            "    postHook(\"session-end\", sessionPayload(ctx));\n  });\n\n  // Refinement lifecycle has no canonical hook event yet, so it rides the\n  // tolerant extension channel (`?event=other&extension=prime-agent&source_event=...`)\n  // pending a canonical enum decision.\n  pi.on(\"session_before_refine\", (_event: any, ctx: any) => {\n    startSession(ctx);\n    postExtensionHook(\"session_before_refine\", sessionPayload(ctx));\n  });\n\n  pi.on(\"refine_complete\", (_event: any, ctx: any) => {\n    startSession(ctx);\n    postExtensionHook(\"refine_complete\", sessionPayload(ctx));\n  });\n}",
+        );
+    debug_assert!(!lifecycle.contains(".omp"));
+    debug_assert!(!lifecycle.contains("const AGENT = \"pi\";"));
+    debug_assert!(!lifecycle.contains("ai-memory-pi-"));
+    lifecycle
+}
+
+/// `postExtensionHook`: the tolerant extension channel for prime-agent
+/// events with no canonical hook-event name (currently the refinement
+/// lifecycle). Posts to `?event=other&extension=prime-agent&source_event=<name>`,
+/// which the server ingests without a dedicated enum variant.
+const PRIME_EXTENSION_HOOK_SOURCE: &str = r#"function postExtensionHook(sourceEvent: string, payload: Record<string, unknown>): void {
+  const url = new URL(`${SERVER}/hook`);
+  url.searchParams.set("event", "other");
+  url.searchParams.set("agent", AGENT);
+  url.searchParams.set("extension", AGENT);
+  url.searchParams.set("source_event", sourceEvent);
+  applyMarkerParams(url, typeof payload.cwd === "string" ? payload.cwd : undefined);
+  const policy = capturePolicy(payload, typeof payload.cwd === "string" ? payload.cwd : undefined);
+  if (policy.disposition === "drop") return;
+  try {
+    enqueueHook("other", url, policy.payload);
+  } catch (_e) {
+    // Best-effort capture. Hooks must never block the agent.
+  }
+}"#;
+
+fn prime_mcp_bridge_source() -> &'static str {
+    r#"
+// ---- MCP bridge ------------------------------------------------------------
+const MCP_SERVER = deriveMcpServer(SERVER);
+const MCP_REQUEST_TIMEOUT_MS = 10000;
+let mcpRequestId = 0;
+
+function deriveMcpServer(server: string): string {
+  const trimmed = server.replace(/\/+$/, "");
+  return trimmed.endsWith("/mcp") ? trimmed : `${trimmed}/mcp`;
+}
+
+function mcpSessionId(ctx: any): string | undefined {
+  const id = sessionID(ctx) ?? ctx?.sessionId ?? ctx?.sessionID ?? ctx?.session?.id;
+  return typeof id === "string" && id.length > 0 ? id : undefined;
+}
+
+function mcpSignal(signal?: AbortSignal): AbortSignal | undefined {
+  const timeout = timeoutSignal(MCP_REQUEST_TIMEOUT_MS);
+  if (!signal) return timeout;
+  if (!timeout) return signal;
+  const anyFactory = (AbortSignal as unknown as { any?: (signals: AbortSignal[]) => AbortSignal }).any;
+  return anyFactory ? anyFactory([signal, timeout]) : timeout;
+}
+
+async function mcpRpc(method: string, params?: unknown, ctx?: any, signal?: AbortSignal): Promise<any> {
+  const id = ++mcpRequestId;
+  const headers: Record<string, string> = {
+    "Content-Type": "application/json",
+    "Accept": "application/json, text/event-stream",
+    ...authHeaders(),
+  };
+  const session = mcpSessionId(ctx);
+  if (session) {
+    headers["X-Memory-Actor-Session-Id"] = session;
+    headers["Mcp-Session-Id"] = session;
+  }
+  const response = await fetch(MCP_SERVER, {
+    method: "POST",
+    headers,
+    body: JSON.stringify({ jsonrpc: "2.0", id, method, params: params ?? {} }),
+    signal: mcpSignal(signal),
+  });
+  if (!response.ok) throw new Error(`ai-memory MCP ${method} failed: HTTP ${response.status}`);
+  const payload = await response.json();
+  if (payload?.error) throw new Error(`ai-memory MCP ${method} failed: ${payload.error.message ?? JSON.stringify(payload.error)}`);
+  if (payload?.result?.isError) throw new Error(`ai-memory MCP ${method} returned isError`);
+  return payload?.result;
+}
+
+function toolInputSchema(tool: any): any {
+  return tool?.inputSchema ?? { type: "object", additionalProperties: true };
+}
+
+async function bootstrapMcpBridge(pi: any): Promise<void> {
+  try {
+    await mcpRpc("initialize", {
+      protocolVersion: "2025-03-26",
+      capabilities: {},
+      clientInfo: { name: "ai-memory-prime-agent-extension", version: "0.0.0" },
+    });
+    try { await mcpRpc("notifications/initialized"); } catch (_e) {}
+    const listed = await mcpRpc("tools/list");
+    for (const tool of listed?.tools ?? []) {
+      try {
+        pi.registerTool({
+          name: tool.name,
+          label: tool.name,
+          description: tool.description,
+          parameters: toolInputSchema(tool),
+          execute: async (_toolCallId: string, params: unknown, signal?: AbortSignal, _onUpdate?: unknown, ctx?: any) => {
+            const result = await mcpRpc("tools/call", { name: tool.name, arguments: params ?? {} }, ctx, signal);
+            return { content: result?.content ?? [], details: result };
+          },
+        });
+      } catch (_e) {
+        // Duplicate registration or tool-shape mismatch must not break lifecycle capture.
+      }
+    }
+  } catch (_e) {
+    // MCP bridge is best-effort; extension load and lifecycle capture must survive.
+  }
+}
+"#
+}
+
 fn build_omp_extension(
     server_url: &str,
     auth_token: Option<&str>,
@@ -6163,6 +6454,7 @@ command = "AI_MEMORY_HOOK_URL=http://h AI_MEMORY_PROJECT_STRATEGY=repo-root /x/a
             (AgentChoice::OpenCode, "opencode"),
             (AgentChoice::OpenCode2, "opencode2"),
             (AgentChoice::Pi, "pi"),
+            (AgentChoice::PrimeAgent, "prime-agent"),
             (AgentChoice::Omp, "omp"),
             (AgentChoice::Openclaw, "openclaw"),
         ] {
@@ -7817,6 +8109,15 @@ model = "gpt-5"
                 "pi",
                 build_pi_extension("http://127.0.0.1:49374", Some("tok"), None, "denylist"),
             ),
+            (
+                "prime-agent",
+                build_prime_agent_extension(
+                    "http://127.0.0.1:49374",
+                    Some("tok"),
+                    None,
+                    "denylist",
+                ),
+            ),
         ] {
             // The fire-and-forget delivery must be gone...
             assert!(
@@ -8704,6 +9005,224 @@ model = "gpt-5"
         assert!(!extension.contains("serve --stdio"));
     }
 
+    #[test]
+    fn prime_extension_path_honours_prime_agent_coding_agent_dir() {
+        let custom = if cfg!(windows) {
+            r"C:\custom\prime-agent"
+        } else {
+            "/custom/prime-agent"
+        };
+        let path = prime_extension_path_in(Some(std::ffi::OsString::from(custom))).unwrap();
+        assert_eq!(
+            path,
+            Path::new(custom)
+                .join("extensions")
+                .join("ai-memory-prime-agent.ts")
+        );
+
+        // Unset and blank both fall back to ~/.prime/agent/extensions/ai-memory-prime-agent.ts.
+        // Blank counts as unset because an exported-but-empty variable is nearly
+        // always a failed shell expansion, not a request to install into the
+        // filesystem root.
+        for env in [None, Some(std::ffi::OsString::new())] {
+            let path = prime_extension_path_in(env).unwrap();
+            assert!(
+                path.ends_with(
+                    Path::new(".prime")
+                        .join("agent")
+                        .join("extensions")
+                        .join("ai-memory-prime-agent.ts")
+                ),
+                "default must be ~/.prime/agent/extensions/ai-memory-prime-agent.ts, got {}",
+                path.display()
+            );
+        }
+    }
+
+    #[test]
+    fn prime_extension_hint_follows_prime_agent_coding_agent_dir() {
+        let custom = if cfg!(windows) {
+            r"C:\custom\prime-agent"
+        } else {
+            "/custom/prime-agent"
+        };
+        let hint = prime_extension_hint_in(Some(std::ffi::OsString::from(custom)));
+        assert!(
+            hint.contains("custom") && hint.ends_with("ai-memory-prime-agent.ts"),
+            "hint must point at the relocated agent home, got: {hint}"
+        );
+        assert!(
+            !hint.contains(".prime/agent"),
+            "hint must not advertise the default home when the var is set: {hint}"
+        );
+
+        let hint = prime_extension_hint_in(None);
+        let tail: PathBuf = [".prime", "agent", "extensions", "ai-memory-prime-agent.ts"]
+            .iter()
+            .collect();
+        assert!(
+            hint.ends_with(&tail.display().to_string()),
+            "unset must keep the documented default, got: {hint}"
+        );
+    }
+
+    #[test]
+    fn prime_extension_is_directly_discoverable_by_prime_agent() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp
+            .path()
+            .join("extensions")
+            .join("ai-memory-prime-agent.ts");
+        let args = InstallHooksArgs {
+            agent: AgentChoice::PrimeAgent,
+            capture_assistant: false,
+            no_capture_prompts: false,
+            capture_mode: None,
+            capture_prompts: false,
+            hooks_dir: None,
+            server_url: Some("http://127.0.0.1:49374".into()),
+            auth_token: None,
+            as_user: None,
+            apply: true,
+            config_file: Some(path.clone()),
+            project_strategy: Some(ProjectStrategyArg::Basename),
+            profile: None,
+        };
+
+        let resolved = resolve_prime_extension_path(&args).unwrap();
+
+        assert_eq!(resolved, path);
+        assert_eq!(
+            resolved.file_name().and_then(|s| s.to_str()),
+            Some("ai-memory-prime-agent.ts")
+        );
+        assert_eq!(
+            resolved
+                .parent()
+                .and_then(|p| p.file_name())
+                .and_then(|s| s.to_str()),
+            Some("extensions")
+        );
+    }
+
+    #[test]
+    fn prime_extension_bakes_allowlist_admit_gate() {
+        let extension =
+            build_prime_agent_extension("http://127.0.0.1:49374", Some("tok"), None, "allowlist");
+        assert!(
+            extension.contains("const CAPTURE_MODE: \"allowlist\" | \"denylist\" = \"allowlist\";"),
+            "{extension}"
+        );
+        assert!(extension.contains(CAPTURE_ADMIT_GATE_TS), "{extension}");
+    }
+
+    #[test]
+    fn prime_extension_denylist_bakes_inert_gate() {
+        let extension =
+            build_prime_agent_extension("http://127.0.0.1:49374", Some("tok"), None, "denylist");
+        assert!(
+            extension.contains("const CAPTURE_MODE: \"allowlist\" | \"denylist\" = \"denylist\";"),
+            "{extension}"
+        );
+        assert!(extension.contains(CAPTURE_ADMIT_GATE_TS), "{extension}");
+    }
+
+    #[test]
+    fn prime_extension_uses_bounded_hook_queue() {
+        let extension =
+            build_prime_agent_extension("http://127.0.0.1:49374", Some("tok"), None, "denylist");
+
+        assert_generated_ts_uses_bounded_hook_queue(&extension);
+    }
+
+    #[test]
+    fn prime_extension_resolves_token_at_runtime_when_not_embedded() {
+        let extension =
+            build_prime_agent_extension("http://127.0.0.1:49374", None, None, "denylist");
+        assert!(extension.contains("function resolveToken("));
+        assert!(extension.contains("process.env.AI_MEMORY_AUTH_TOKEN"));
+        assert!(extension.contains("auth-token"));
+        assert!(extension.contains("if (!response.ok) return undefined;"));
+    }
+
+    #[test]
+    fn prime_extension_contains_lifecycle_capture_and_mcp_bridge() {
+        let extension = build_prime_agent_extension(
+            "http://127.0.0.1:49374/base",
+            Some("tok"),
+            None,
+            "denylist",
+        );
+
+        assert!(extension.contains("export default function AiMemoryExtension(pi: any): void"));
+        assert!(extension.contains("const AGENT = \"prime-agent\";"));
+        assert!(extension.contains("install-hooks --agent prime-agent --apply"));
+        assert!(extension.contains("pi.on(\"session_start\""));
+        assert!(extension.contains("pi.on(\"before_agent_start\""));
+        assert!(extension.contains("pi.on(\"tool_call\""));
+        assert!(extension.contains("pi.on(\"tool_result\""));
+        assert!(extension.contains("pi.on(\"session_before_compact\""));
+        assert!(extension.contains("pi.on(\"session_compact\""));
+        assert!(!extension.contains("pi.on(\"session.compacting\""));
+        assert!(extension.contains("pi.on(\"agent_end\""));
+        assert!(extension.contains("pi.on(\"session_shutdown\""));
+        assert!(extension.contains("postHook(\"session-start\""));
+        assert!(extension.contains("postHook(\"user-prompt\""));
+        assert!(extension.contains("postHook(\"pre-tool-use\""));
+        assert!(extension.contains("postHook(\"post-tool-use\""));
+        assert!(extension.contains("postHook(\"pre-compact\""));
+        assert!(extension.contains("postHook(\"stop\""));
+        assert!(extension.contains("postHook(\"session-end\""));
+        // Refinement lifecycle rides the tolerant extension channel
+        // pending a canonical enum decision.
+        assert!(extension.contains("pi.on(\"session_before_refine\""));
+        assert!(extension.contains("pi.on(\"refine_complete\""));
+        assert!(extension.contains("function postExtensionHook("));
+        assert!(extension.contains("url.searchParams.set(\"event\", \"other\");"));
+        assert!(extension.contains("url.searchParams.set(\"extension\", AGENT);"));
+        assert!(extension.contains("url.searchParams.set(\"source_event\", sourceEvent);"));
+        assert!(extension.contains("postExtensionHook(\"session_before_refine\""));
+        assert!(extension.contains("postExtensionHook(\"refine_complete\""));
+        assert!(extension.contains("fetchHandoff"));
+        assert!(extension.contains("customType: \"ai-memory-handoff\""));
+        assert!(extension.contains("const MCP_SERVER = deriveMcpServer(SERVER);"));
+        assert!(extension.contains("clientInfo: { name: \"ai-memory-prime-agent-extension\""));
+        assert!(
+            extension.contains("return trimmed.endsWith(\"/mcp\") ? trimmed : `${trimmed}/mcp`;")
+        );
+        assert!(extension.contains("\"Accept\": \"application/json, text/event-stream\""));
+        assert!(extension.contains("...authHeaders()"));
+        assert!(extension.contains("headers[\"X-Memory-Actor-Session-Id\"] = session;"));
+        assert!(extension.contains("headers[\"Mcp-Session-Id\"] = session;"));
+        assert!(extension.contains("function mcpSignal(signal?: AbortSignal)"));
+        assert!(extension.contains("anyFactory([signal, timeout])"));
+        assert!(extension.contains("mcpRpc(\"initialize\""));
+        assert!(extension.contains("mcpRpc(\"notifications/initialized\""));
+        assert!(extension.contains("mcpRpc(\"tools/list\""));
+        assert!(extension.contains("pi.registerTool"));
+        assert!(extension.contains("label: tool.name"));
+        assert!(extension.contains("parameters: toolInputSchema(tool)"));
+        assert!(extension.contains(
+            "mcpRpc(\"tools/call\", { name: tool.name, arguments: params ?? {} }, ctx, signal)"
+        ));
+        assert!(extension.contains("payload?.error"));
+        assert!(extension.contains("payload?.result?.isError"));
+        assert!(extension.contains("response.ok"));
+        assert!(extension.contains("signal: mcpSignal(signal)"));
+        assert!(extension.contains("Bearer ${token}"));
+        assert!(extension.contains("tok"));
+        assert!(extension.contains("import { execFileSync } from \"node:child_process\";"));
+        assert!(extension.contains("function findMarker("));
+        assert!(extension.contains("function resolveToken("));
+        assert!(extension.contains("function spoolFailedHook("));
+        assert!(extension.contains("async function drainHookSpool()"));
+        assert!(!extension.contains(".omp"));
+        assert!(!extension.contains("const AGENT = \"pi\";"));
+        assert!(!extension.contains("ai-memory-pi-"));
+        assert!(!extension.contains("serve --transport stdio"));
+        assert!(!extension.contains("serve --stdio"));
+    }
+
     // Windows 11 + Git Bash support matters for regulated enterprise setups
     // where Git Bash is the approved shell available from the corporate
     // repository, so this installer contract should be exercised anywhere
@@ -8720,7 +9239,15 @@ model = "gpt-5"
             return;
         };
 
-        for alias in ["opencode", "openclaw", "omp", "oh-my-pi", "pi"] {
+        for alias in [
+            "opencode",
+            "openclaw",
+            "omp",
+            "oh-my-pi",
+            "pi",
+            "prime",
+            "prime-agent",
+        ] {
             let output = Command::new(&bash)
                 .arg(&script)
                 .arg("--agent")
@@ -8750,6 +9277,12 @@ model = "gpt-5"
                     assert!(stdout.contains("~/.pi/agent/extensions/ai-memory.ts"));
                     assert!(stdout.contains("MCP tools come through the same generated bridge"));
                     assert!(!stdout.contains("~/.omp/agent/extensions/ai-memory.ts"));
+                }
+                "prime" | "prime-agent" => {
+                    assert!(stdout.contains("install-hooks --agent prime-agent --apply"));
+                    assert!(stdout.contains("~/.prime/agent/extensions/ai-memory-prime-agent.ts"));
+                    assert!(stdout.contains("MCP tools come through the same generated bridge"));
+                    assert!(!stdout.contains("~/.pi/agent/extensions/ai-memory.ts"));
                 }
                 _ => unreachable!(),
             }

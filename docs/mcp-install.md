@@ -22,7 +22,7 @@ agent CLIs beyond the README quick start.
 The hook-capable clients in the [README Support Matrix](../README.md#support-matrix)
 have automatic capture integrations (host-native commands for supported local
 profiles, plus generated TypeScript plugin/extension files for OpenClaw,
-OpenCode, OMP, and Pi).
+OpenCode, OMP, Pi, and Prime-agent).
 Claude Code may use its supported Windows exec form; other agents use native
 single command strings according to their hook schema. PowerShell/Git Bash
 script bundles are compatibility fallbacks and do not enforce capture-policy
@@ -33,7 +33,7 @@ stdout (or their equivalent context-injection result); Grok and Zero must call
 `memory_handoff_accept` when resuming.
 
 Capture exclusions are separate from MCP registration. Native hook commands and
-generated OpenCode/OMP/Pi/OpenClaw integrations enforce `[capture]
+generated OpenCode/OMP/Pi/Prime-agent/OpenClaw integrations enforce `[capture]
 ignore_paths`; legacy shell/PowerShell and remote-only/Docker script bundles do
 not. Reinstall/refresh an existing hook or plugin to gain it; see
 [Capture exclusions](marker-file.md#capture-exclusions).
@@ -120,7 +120,7 @@ metadata.
 > **One-shot tip:** every snippet below is also reachable from the
 > CLI:
 > ```bash
-> ai-memory install-mcp --client gemini-cli   # or cursor / claude-desktop / openclaw / omp / pi / antigravity-cli / grok / kimi-code / kiro-cli / command-code / swival / devin / zero / zcode / vscode-copilot / zed
+> ai-memory install-mcp --client gemini-cli   # or cursor / claude-desktop / openclaw / omp / pi / prime-agent / antigravity-cli / grok / kimi-code / kiro-cli / command-code / swival / devin / zero / zcode / vscode-copilot / zed
 > ```
 
 ---
@@ -1151,6 +1151,34 @@ ignored `~/.pi/agent/mcp.json`.
 
 OMP / Oh My Pi remains separate: use `--client omp` / `--agent omp` (or
 `oh-my-pi`) for `.omp` paths.
+
+## Prime-agent
+
+**Status:** ✅ MCP and lifecycle capture supported. `install-mcp --client
+prime-agent` (alias `prime`) merges a native HTTP entry into the `mcpServers` map of the
+user-global `~/.prime/agent/settings.json` (project
+`.prime/agent/settings.json` entries are ignored for execution), preserving
+unrelated keys and sibling servers; re-runs are a no-op and `uninstall`
+removes only the entry it added. When `PRIME_AGENT_CODING_AGENT_DIR` is set
+(it relocates prime-agent's whole `~/.prime/agent` home), the settings file
+resolves under it instead. Pair with `install-hooks --agent prime-agent --apply`
+(or `--agent prime`), which writes
+`~/.prime/agent/extensions/ai-memory-prime-agent.ts` for lifecycle capture: the
+settings entry is the model-invoked read faucet (a read-only `enabledTools`
+subset: `memory_query`, `memory_read_page`), while the extension is the
+lifecycle pipe that captures session events automatically.
+
+```bash
+ai-memory install-mcp --client prime-agent --apply
+ai-memory install-hooks --agent prime-agent --apply
+```
+
+The generated extension posts lifecycle events to `/hook`, fetches pending
+handoffs in `before_agent_start`, initializes ai-memory's HTTP `/mcp` endpoint,
+lists tools, and registers each one with `pi.registerTool`. With
+`--auth-token`, the settings entry names `AI_MEMORY_AUTH_TOKEN` rather than
+embedding the token — export it in your shell init before starting
+prime-agent.
 
 ---
 

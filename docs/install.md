@@ -9,7 +9,7 @@ path (docker + Claude Code). This page covers everything else:
 - [Arch Linux native packages (AUR)](#arch-linux-native-packages-aur)
   (systemd system service or user service)
 - [Configuring other agent CLIs](#configuring-other-agent-clis)
-  (Codex, Command Code, Devin CLI, OpenCode, OMP, Pi, Cursor, Claude Desktop, Gemini CLI, Antigravity CLI, Grok Build CLI, Zero, ZCode, Kimi Code, Kiro CLI, Pool, OpenClaw, VS Code Copilot, Zed)
+  (Codex, Command Code, Devin CLI, OpenCode, OMP, Pi, Prime-agent, Cursor, Claude Desktop, Gemini CLI, Antigravity CLI, Grok Build CLI, Zero, ZCode, Kimi Code, Kiro CLI, Pool, OpenClaw, VS Code Copilot, Zed)
 - [Installing hooks without docker](#installing-hooks-without-docker)
   (curl-based installer)
 - [Running ai-memory without docker](#running-ai-memory-without-docker)
@@ -445,7 +445,7 @@ a script fallback.
 ### Capture-policy capability and refresh
 
 `[capture] ignore_paths` is enforced only by native `ai-memory hook` commands
-and generated OpenCode/OMP/Pi/OpenClaw integrations. Local installers select
+and generated OpenCode/OMP/Pi/Prime-agent/OpenClaw integrations. Local installers select
 native commands where supported; legacy `.sh`/`.ps1` hooks and remote-only or
 Docker script bundles do not enforce it. Re-run `install-hooks --agent <agent>
 --apply` or refresh/reinstall generated plugins after upgrading; installer
@@ -715,7 +715,7 @@ including Pi and Zero, have lifecycle capture paths through `install-hooks`.
 > enforce capture-policy v1. Remote-only/Docker script installs still use the
 > two-step path: (1) `docker cp` bundled scripts to your home dir, (2)
 > `docker run --rm install-hooks` renders the config snippet.
-> OpenClaw, OpenCode, OMP, and Pi are different: they use generated
+> OpenClaw, OpenCode, OMP, Pi, and Prime-agent are different: they use generated
 > TypeScript plugin/extension files, so no shell-script extraction is
 > needed for those clients.
 
@@ -1239,6 +1239,39 @@ ai-memory install-mcp --client pi --server-url "http://homelab:49374/mcp"
 
 Restart Pi after installing or changing the extension. OMP / Oh My Pi remains
 separate and continues to use `.omp` paths.
+
+### Prime-agent
+
+Prime-agent gets both halves: lifecycle capture through one generated
+TypeScript extension at `~/.prime/agent/extensions/ai-memory-prime-agent.ts`, and
+model-invoked reads through a native `mcpServers` entry in the user-global
+`~/.prime/agent/settings.json`. The extension captures lifecycle events and
+bridges ai-memory's HTTP MCP tools into prime-agent with `pi.registerTool`;
+the settings entry exposes a read-only `enabledTools` subset
+(`memory_query`, `memory_read_page`) so the model can pull context on demand
+while writes stay lifecycle-automatic. When
+`PRIME_AGENT_CODING_AGENT_DIR` is set (it relocates prime-agent's whole
+`~/.prime/agent` home), both the extension and the settings file resolve
+under it instead. prime-agent uses its own config directory, so it never
+shares an extensions directory with Pi or OMP.
+
+```bash
+ai-memory install-hooks --agent prime-agent --apply \
+    --server-url "http://homelab:49374" \
+    --auth-token "$TOKEN"
+
+ai-memory install-mcp --client prime-agent --apply \
+    --server-url "http://homelab:49374/mcp" \
+    --auth-token "$TOKEN"
+# With --auth-token the entry names AI_MEMORY_AUTH_TOKEN rather than
+# embedding the token: export it in your shell init.
+# (`--agent prime` / `--client prime` are accepted as aliases.)
+```
+
+Restart prime-agent after installing or changing the extension. The
+refinement lifecycle (`session_before_refine`, `refine_complete`) is captured
+through the extension channel until prime-agent documents a canonical hook
+event for it.
 
 ### Bind mounts vs docker cp
 

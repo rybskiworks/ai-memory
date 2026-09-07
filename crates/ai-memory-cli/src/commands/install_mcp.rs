@@ -71,6 +71,7 @@ pub fn run(config: &Config, args: InstallMcpArgs) -> Result<()> {
         McpClient::GeminiCli => render_gemini_cli(&args)?,
         McpClient::Openclaw => render_openclaw(&args)?,
         McpClient::Pi => render_pi(&args)?,
+        McpClient::PrimeAgent => render_prime(&args)?,
         McpClient::Omp => render_omp(&args)?,
         McpClient::AntigravityCli => render_antigravity_cli(&args)?,
         McpClient::Zero => render_zero(&args)?,
@@ -206,6 +207,9 @@ pub(crate) fn mcp_config_path(client: crate::cli::McpClient) -> Result<PathBuf> 
         McpClient::Pi => bail!(
             "Pi has no native mcp.json; use `ai-memory install-hooks --agent pi --apply` to install the generated MCP bridge extension."
         ),
+        McpClient::PrimeAgent => {
+            prime_settings_path_in(std::env::var_os("PRIME_AGENT_CODING_AGENT_DIR"))?
+        }
         McpClient::Omp => home()?.join(".omp").join("agent").join("mcp.json"),
         McpClient::AntigravityCli => home()?
             .join(".gemini")
@@ -399,6 +403,23 @@ fn kiro_home(env_override: Option<std::ffi::OsString>) -> Result<PathBuf> {
         .join(".kiro"))
 }
 
+/// prime-agent's user settings file: `$PRIME_AGENT_CODING_AGENT_DIR/settings.json`
+/// when the var relocates the agent home, else `~/.prime/agent/settings.json`.
+/// This resolves the same agent home `install-hooks --agent prime-agent` uses for
+/// its generated extension, so both halves of one install point at the same
+/// agent. The env value comes in as a parameter so tests can exercise both
+/// branches without mutating process env.
+fn prime_settings_path_in(env_override: Option<std::ffi::OsString>) -> Result<PathBuf> {
+    if let Some(dir) = crate::commands::path_util::agent_config_home(env_override) {
+        return Ok(dir.join("settings.json"));
+    }
+    Ok(home_dir()
+        .context("could not locate $HOME for ~/.prime/agent/settings.json")?
+        .join(".prime")
+        .join("agent")
+        .join("settings.json"))
+}
+
 /// Resolve Grok Build CLI's user configuration root. Grok honours
 /// `GROK_HOME`; otherwise it uses `~/.grok`.
 pub(crate) fn grok_home() -> Result<PathBuf> {
@@ -502,6 +523,7 @@ fn json_mcp_location(client: McpClient) -> Option<JsonMcpLocation> {
         | McpClient::KimiCode
         | McpClient::KiroCli
         | McpClient::CommandCode
+        | McpClient::PrimeAgent
         | McpClient::Swival => Some(JsonMcpLocation::RootMcpServers),
         McpClient::OpenCode => Some(JsonMcpLocation::RootMcp),
         // V2 nests servers under `mcp.servers` — the same shape OpenClaw,
@@ -524,6 +546,7 @@ fn build_json_mcp_entry(args: &InstallMcpArgs) -> Result<serde_json::Value> {
         McpClient::OpenCode => build_mcp_entry_opencode(args),
         McpClient::OpenCode2 => build_mcp_entry_opencode2(args),
         McpClient::Openclaw => build_mcp_entry_openclaw(args),
+        McpClient::PrimeAgent => build_mcp_entry_prime_agent(args),
         McpClient::Zero => build_mcp_entry_zero(args),
         McpClient::Zcode => build_mcp_entry_zcode(args),
         McpClient::Codex | McpClient::Grok => {
@@ -805,6 +828,49 @@ fn build_mcp_entry_openclaw(args: &InstallMcpArgs) -> Result<serde_json::Value> 
     if let Some(b) = bearer {
         entry.insert("headers".into(), json!({"Authorization": b}));
     }
+    Ok(serde_json::Value::Object(entry))
+}
+
+/// prime-agent MCP entry for the top-level `mcpServers` map in the user's
+/// `settings.json` (`~/.prime/agent/settings.json`, or
+/// `$PRIME_AGENT_CODING_AGENT_DIR/settings.json` when set; project
+/// `.prime/agent/settings.json` entries are ignored for execution, so the
+/// installer targets the user-global file like the generated extension).
+///
+/// Structural analog is OpenCode: a generated TypeScript artifact owns
+/// lifecycle capture (prime's `ai-memory-prime-agent.ts` extension, like OpenCode's
+/// plugin) while a declarative MCP-servers JSON config gives the model its
+/// tools. The merge mechanics are shared with every other `mcpServers`
+/// client (Gemini CLI's `settings.json` is the closest file-shape match:
+/// one JSON object holding unrelated keys beside the servers map, merged
+/// in place with siblings preserved). Codex is deliberately not the analog:
+/// its TOML `[mcp_servers.<name>]` table with `http_headers` auth has no
+/// counterpart in prime's JSON settings.
+///
+/// Auth follows prime's credential model rather than the literal
+/// `Authorization` header the other JSON clients embed: prime's `mcp add`
+/// only accepts environment-variable references for bearer secrets, so with
+/// `--auth-token` this emits `bearerTokenEnvVar` naming `AI_MEMORY_AUTH_TOKEN`
+/// (export it in the shell init) instead of stranding the literal token in a
+/// settings file. Without a token the entry stays anonymous, which prime
+/// accepts for HTTP servers.
+///
+/// `enabledTools` is a read-only subset (`memory_query`, `memory_read_page`):
+/// the model invokes reads on demand while writes stay lifecycle-automatic
+/// through the extension's hook capture, so the faucet cannot bypass the
+/// sanitizer/bounding the capture pipe already enforces.
+fn build_mcp_entry_prime_agent(args: &InstallMcpArgs) -> Result<serde_json::Value> {
+    let server_url = args.server_url.as_deref().unwrap_or(DEFAULT_MCP_URL);
+    let mut entry = serde_json::Map::new();
+    entry.insert("type".into(), json!("http"));
+    entry.insert("url".into(), json!(server_url));
+    if args.auth_token.is_some() {
+        entry.insert("bearerTokenEnvVar".into(), json!("AI_MEMORY_AUTH_TOKEN"));
+    }
+    entry.insert(
+        "enabledTools".into(),
+        json!(["memory_query", "memory_read_page"]),
+    );
     Ok(serde_json::Value::Object(entry))
 }
 
@@ -1216,6 +1282,29 @@ fn pi_mcp_apply_guidance(args: &InstallMcpArgs) -> String {
             ""
         }
     )
+}
+
+fn render_prime(args: &InstallMcpArgs) -> Result<String> {
+    let settings_path = prime_settings_path_in(std::env::var_os("PRIME_AGENT_CODING_AGENT_DIR"))?;
+    let mut out = format!(
+        "# prime-agent — merge into {settings_path}:\n\
+         #\n\
+         # prime-agent reads generic MCP servers from the top-level\n\
+         # `mcpServers` map of the user-global settings file (project\n\
+         # `.prime/agent/settings.json` entries are ignored for execution).\n\
+         # This is the model-invoked read faucet; lifecycle capture stays\n\
+         # on the generated extension (`install-hooks --agent prime-agent`).\n",
+        settings_path = settings_path.display(),
+    );
+    if args.auth_token.is_some() {
+        out.push_str(
+            "# The entry names AI_MEMORY_AUTH_TOKEN rather than embedding the\n\
+             # token: export it in your shell init before starting prime-agent.\n",
+        );
+    }
+    out.push_str(&render_json_mcp_fragment(args)?);
+    out.push('\n');
+    Ok(out)
 }
 
 fn hook_server_url_from_mcp_url(url: &str) -> String {
@@ -1772,6 +1861,7 @@ mod tests {
             McpClient::GeminiCli => render_gemini_cli(&args).unwrap(),
             McpClient::Openclaw => render_openclaw(&args).unwrap(),
             McpClient::Pi => render_pi(&args).unwrap(),
+            McpClient::PrimeAgent => render_prime(&args).unwrap(),
             McpClient::Omp => render_omp(&args).unwrap(),
             McpClient::AntigravityCli => render_antigravity_cli(&args).unwrap(),
             McpClient::Zero => render_zero(&args).unwrap(),
@@ -1843,6 +1933,7 @@ mod tests {
             McpClient::GeminiCli,
             McpClient::Openclaw,
             McpClient::Omp,
+            McpClient::PrimeAgent,
             McpClient::AntigravityCli,
             McpClient::Zero,
             McpClient::Zcode,
@@ -1877,6 +1968,7 @@ mod tests {
             McpClient::GeminiCli => render_gemini_cli(&args).unwrap(),
             McpClient::Openclaw => render_openclaw(&args).unwrap(),
             McpClient::Pi => render_pi(&args).unwrap(),
+            McpClient::PrimeAgent => render_prime(&args).unwrap(),
             McpClient::Omp => render_omp(&args).unwrap(),
             McpClient::AntigravityCli => render_antigravity_cli(&args).unwrap(),
             McpClient::Zero => render_zero(&args).unwrap(),
@@ -2018,6 +2110,15 @@ mod tests {
         assert!(pi.contains("install-hooks --agent pi --apply"));
         assert!(pi.contains("~/.pi/agent/extensions/ai-memory.ts"));
         assert!(!pi.contains("~/.omp"));
+        let prime = render_prime(&args_for(McpClient::PrimeAgent)).unwrap();
+        assert!(prime.contains("\"mcpServers\""));
+        assert!(prime.contains("~/.prime/agent/settings.json"));
+        assert!(prime.contains("install-hooks --agent prime-agent"));
+        assert!(!prime.contains("~/.pi/"));
+        let prime_token = render_with_token(McpClient::PrimeAgent);
+        assert!(prime_token.contains("\"bearerTokenEnvVar\""));
+        assert!(prime_token.contains("AI_MEMORY_AUTH_TOKEN"));
+        assert!(!prime_token.contains("Bearer test-token-deadbeef"));
         assert!(render_for_test(McpClient::AntigravityCli).contains("\"serverUrl\""));
         // The snippet must point at the documented global config, not the
         // internal ~/.gemini/antigravity-cli/ data dir (#510).
@@ -2326,6 +2427,124 @@ mod tests {
 
         assert!(guidance.contains("--server-url http://host:49374/base --auth-token <token>"));
         assert!(!guidance.contains("--server-url http://host:49374/base/mcp"));
+    }
+
+    /// prime-agent's generic MCP entry: `type: "http"` + `url` under the
+    /// user settings' top-level `mcpServers`, with a read-only
+    /// `enabledTools` subset. With a token the entry names
+    /// `bearerTokenEnvVar` (never a literal header); without one it stays
+    /// anonymous, which prime accepts for HTTP servers.
+    #[test]
+    fn prime_entry_uses_documented_http_shape() {
+        let fragment = render_json_mcp_fragment(&args_for(McpClient::PrimeAgent)).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&fragment).unwrap();
+
+        assert_eq!(
+            value,
+            json!({
+                "mcpServers": {
+                    "ai-memory": {
+                        "type": "http",
+                        "url": "http://127.0.0.1:49374/mcp",
+                        "enabledTools": ["memory_query", "memory_read_page"]
+                    }
+                }
+            })
+        );
+
+        let fragment = render_json_mcp_fragment(&args_with_token(McpClient::PrimeAgent)).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&fragment).unwrap();
+        assert_eq!(
+            value["mcpServers"]["ai-memory"]["bearerTokenEnvVar"],
+            "AI_MEMORY_AUTH_TOKEN"
+        );
+        assert!(
+            value["mcpServers"]["ai-memory"].get("headers").is_none(),
+            "prime entries must not carry a literal Authorization header"
+        );
+    }
+
+    #[test]
+    fn prime_settings_path_honours_env_override() {
+        assert_eq!(
+            prime_settings_path_in(Some("/tmp/custom-prime-home".into())).unwrap(),
+            PathBuf::from("/tmp/custom-prime-home").join("settings.json")
+        );
+        let default = home_dir().unwrap().join(".prime").join("agent");
+        // An empty override falls back to the default home-based dir.
+        assert_eq!(
+            prime_settings_path_in(Some("".into())).unwrap(),
+            default.join("settings.json")
+        );
+        assert_eq!(
+            prime_settings_path_in(None).unwrap(),
+            default.join("settings.json")
+        );
+    }
+
+    /// `--apply` merges under `mcpServers` keeping unrelated settings keys
+    /// (models, extensions, and the like) plus sibling servers intact, and
+    /// re-runs are a no-op.
+    #[test]
+    fn prime_apply_preserves_settings_keys_and_is_idempotent() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config_path = tmp.path().join("settings.json");
+        fs::write(
+            &config_path,
+            r#"{
+  "defaultModel": "claude-sonnet-4-20250514",
+  "extensions": ["./extensions/user-ext.ts"],
+  "mcpServers": {
+    "other": {"type": "http", "url": "https://other.example/mcp"}
+  }
+}"#,
+        )
+        .unwrap();
+        let mut args = args_with_token(McpClient::PrimeAgent);
+        args.config_file = Some(config_path.clone());
+
+        apply_to_config_file(&args).unwrap();
+        let first = fs::read_to_string(&config_path).unwrap();
+        apply_to_config_file(&args).unwrap();
+        let second = fs::read_to_string(&config_path).unwrap();
+
+        assert_eq!(first, second);
+        let value: serde_json::Value = serde_json::from_str(&second).unwrap();
+        assert_eq!(value["defaultModel"], "claude-sonnet-4-20250514");
+        assert_eq!(value["extensions"], json!(["./extensions/user-ext.ts"]));
+        assert_eq!(
+            value["mcpServers"]["other"]["url"], "https://other.example/mcp",
+            "install must preserve sibling servers"
+        );
+        assert_eq!(value["mcpServers"]["ai-memory"]["type"], "http");
+        assert_eq!(
+            value["mcpServers"]["ai-memory"]["enabledTools"],
+            json!(["memory_query", "memory_read_page"])
+        );
+        assert_eq!(
+            value["mcpServers"]["ai-memory"]["bearerTokenEnvVar"],
+            "AI_MEMORY_AUTH_TOKEN"
+        );
+    }
+
+    /// A custom `--server-url` (including a reverse-proxy base path) flows
+    /// into the prime entry exactly like the sibling clients'.
+    #[test]
+    fn prime_apply_honours_server_url_flag() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config_path = tmp.path().join("settings.json");
+        let mut args = args_for(McpClient::PrimeAgent);
+        args.server_url = Some("http://host:49374/base/mcp".into());
+        args.config_file = Some(config_path.clone());
+
+        apply_to_config_file(&args).unwrap();
+
+        let value: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&config_path).unwrap()).unwrap();
+        assert_eq!(
+            value["mcpServers"]["ai-memory"]["url"],
+            "http://host:49374/base/mcp"
+        );
     }
 
     /// The Codex apply path must emit block-form `[mcp_servers.<name>]`

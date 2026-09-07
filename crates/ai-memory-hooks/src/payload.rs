@@ -626,6 +626,7 @@ const fn closed_tool_agent(agent: AgentKind) -> bool {
             | AgentKind::CommandCode
             | AgentKind::OpenCode
             | AgentKind::Pi
+            | AgentKind::PrimeAgent
             | AgentKind::AntigravityCli
             | AgentKind::Hermes
             | AgentKind::Pool
@@ -1769,6 +1770,8 @@ mod tests {
         assert_eq!(parse_agent("agy"), AgentKind::AntigravityCli);
         assert_eq!(parse_agent("omp"), AgentKind::Omp);
         assert_eq!(parse_agent("pi"), AgentKind::Pi);
+        assert_eq!(parse_agent("prime"), AgentKind::PrimeAgent);
+        assert_eq!(parse_agent("prime-agent"), AgentKind::PrimeAgent);
         assert_eq!(parse_agent("oh-my-pi"), AgentKind::Omp);
         assert_eq!(parse_agent("hermes"), AgentKind::Hermes);
         assert_eq!(parse_agent("hermes-agent"), AgentKind::Hermes);
@@ -2611,6 +2614,64 @@ mod tests {
             let body = post.body_excerpt.unwrap();
             assert!(body.contains("tool_call_id: pi-stable-190"));
             assert!(body.contains(&format!("outcome: {outcome}")));
+        }
+    }
+
+    #[test]
+    fn prime_post_outcomes_and_stable_id_are_rendered() {
+        for (is_error, outcome) in [
+            (Some(false), "success"),
+            (Some(true), "error"),
+            (None, "unknown"),
+        ] {
+            let mut raw = serde_json::json!({"tool":"bash","args":{},"callID":"prime-stable-190","output":"result"});
+            if let Some(is_error) = is_error {
+                raw["isError"] = serde_json::json!(is_error);
+            }
+            let pre = HookEnvelope::from_query_and_body(
+                HookQuery {
+                    event: "pre-tool-use".into(),
+                    agent: Some("prime-agent".into()),
+                    ..Default::default()
+                },
+                raw.clone(),
+            );
+            let post = HookEnvelope::from_query_and_body(
+                HookQuery {
+                    event: "post-tool-use".into(),
+                    agent: Some("prime-agent".into()),
+                    ..Default::default()
+                },
+                raw,
+            );
+            assert!(
+                pre.body_excerpt
+                    .unwrap()
+                    .contains("tool_call_id: prime-stable-190")
+            );
+            let body = post.body_excerpt.unwrap();
+            assert!(body.contains("tool_call_id: prime-stable-190"));
+            assert!(body.contains(&format!("outcome: {outcome}")));
+        }
+    }
+
+    #[test]
+    fn prime_refine_events_ingest_tolerantly_as_extension_other() {
+        for source in ["session_before_refine", "refine_complete"] {
+            let env = HookEnvelope::from_query_and_body(
+                HookQuery {
+                    event: "other".into(),
+                    agent: Some("prime-agent".into()),
+                    extension: Some("prime-agent".into()),
+                    source_event: Some(source.into()),
+                    ..Default::default()
+                },
+                serde_json::json!({"sessionID": "prime-refine-1", "cwd": "/tmp/work"}),
+            );
+            assert_eq!(env.event, HookEvent::Other);
+            assert_eq!(env.agent, AgentKind::PrimeAgent);
+            assert_eq!(env.extension.as_deref(), Some("prime-agent"));
+            assert_eq!(env.source_event.as_deref(), Some(source));
         }
     }
 }

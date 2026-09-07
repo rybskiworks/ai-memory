@@ -228,6 +228,9 @@ pub enum AgentKind {
     /// Pi coding agent.
     #[serde(rename = "pi")]
     Pi,
+    /// PrimeIntellect prime-agent coding agent.
+    #[serde(rename = "prime-agent", alias = "prime")]
+    PrimeAgent,
     /// Charmbracelet Crush coding agent.
     Crush,
     /// xAI Grok Build CLI (`grok`).
@@ -258,7 +261,7 @@ impl AgentKind {
     /// CHECK constraint accepts every kind (the Zero integration shipped
     /// with the enum variant but without the V26 migration and only a
     /// live test caught it). Extend together with the enum.
-    pub const ALL: [Self; 21] = [
+    pub const ALL: [Self; 22] = [
         Self::ClaudeCode,
         Self::Codex,
         Self::OpenCode,
@@ -269,6 +272,7 @@ impl AgentKind {
         Self::AntigravityCli,
         Self::Omp,
         Self::Pi,
+        Self::PrimeAgent,
         Self::Crush,
         Self::Grok,
         Self::Zero,
@@ -296,6 +300,7 @@ impl AgentKind {
             Self::AntigravityCli => "antigravity-cli",
             Self::Omp => "omp",
             Self::Pi => "pi",
+            Self::PrimeAgent => "prime-agent",
             Self::Crush => "crush",
             Self::Grok => "grok",
             Self::Zero => "zero",
@@ -325,6 +330,7 @@ impl AgentKind {
             "openclaw" | "open-claw" => Self::OpenClaw,
             "antigravity-cli" | "antigravity" | "agy" => Self::AntigravityCli,
             "pi" => Self::Pi,
+            "prime-agent" | "prime" => Self::PrimeAgent,
             "crush" => Self::Crush,
             "omp" | "oh-my-pi" => Self::Omp,
             "grok" => Self::Grok,
@@ -578,6 +584,30 @@ mod tests {
         );
         assert!(AgentKind::KiroCli.session_start_injects_handoff());
         assert!(!AgentKind::KiroCli.user_prompt_injects_handoff());
+    }
+
+    #[test]
+    fn agent_kind_prime_agent_round_trips_and_injects_session_start_handoff() {
+        assert_eq!(AgentKind::PrimeAgent.as_str(), "prime-agent");
+        assert_eq!(AgentKind::from_wire("prime-agent"), AgentKind::PrimeAgent);
+        assert_eq!(AgentKind::from_wire("prime"), AgentKind::PrimeAgent);
+        assert_eq!(
+            serde_json::to_string(&AgentKind::PrimeAgent).unwrap(),
+            "\"prime-agent\""
+        );
+        assert_eq!(
+            serde_json::from_str::<AgentKind>("\"prime-agent\"").unwrap(),
+            AgentKind::PrimeAgent
+        );
+        assert_eq!(
+            serde_json::from_str::<AgentKind>("\"prime\"").unwrap(),
+            AgentKind::PrimeAgent
+        );
+        assert_eq!(AgentKind::from_wire("prime-2"), AgentKind::Other);
+        // PrimeAgent shares Pi's extension host semantics: session-start stdout
+        // is consumed, so the destructive handoff fetch is safe there.
+        assert!(AgentKind::PrimeAgent.session_start_injects_handoff());
+        assert!(!AgentKind::PrimeAgent.user_prompt_injects_handoff());
     }
 
     #[test]

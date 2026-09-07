@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- Prime-agent lifecycle capture and MCP tools via a generated TypeScript
+  extension. `install-hooks --agent prime-agent --apply` (alias `prime`)
+  writes `~/.prime/agent/extensions/ai-memory-prime-agent.ts` (or
+  `$PRIME_AGENT_CODING_AGENT_DIR/extensions/` when set), which posts
+  lifecycle events to `/hook`, fetches pending handoffs in
+  `before_agent_start`, and registers ai-memory's HTTP MCP tools through
+  `pi.registerTool`; `install-mcp --client prime-agent` (alias `prime`) merges a native HTTP entry
+  with a read-only `enabledTools` subset into the `mcpServers` map of the
+  user-global prime-agent `settings.json` (preserving unrelated keys and
+  sibling servers), and `uninstall` removes only the generated file and the
+  entry it added.
+
 ### Fixed
 - OKF-conformed event ledgers are skipped by the indexer again, so a migrated
   store stops growing without bound. The reserved-file check treated any
