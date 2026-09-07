@@ -46,7 +46,7 @@ while [[ $# -gt 0 ]]; do
 done
 
 case "$AGENT" in
-    claude-code|codex|command-code|cursor|gemini-cli|kimi-code|kiro-cli|antigravity-cli|grok|opencode|opencode2|openclaw|omp|pi|oh-my-pi|prime|prime-agent) ;;
+    claude-code|codex|command-code|cursor|gemini-cli|kimi-code|kiro-cli|antigravity-cli|grok|opencode|opencode2|openclaw|omp|pi|oh-my-pi|prime-agent) ;;
     commandcode|cmdc|cmd) AGENT="command-code" ;;
     kiro) AGENT="kiro-cli" ;;
     opencode-v2|open-code2) AGENT="opencode2" ;;
@@ -106,6 +106,7 @@ if [[ "$AGENT" == "prime-agent" ]]; then
     echo "Run: ai-memory install-hooks --agent prime-agent --apply"
     echo "Then restart prime-agent so it loads ~/.prime/agent/extensions/ai-memory-prime-agent.ts."
     echo "MCP tools come through the same generated bridge extension."
+    echo "For on-demand reads also run: ai-memory install-mcp --client prime-agent --apply"
     exit 0
 fi
 

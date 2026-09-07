@@ -7391,6 +7391,40 @@ command = "AI_MEMORY_HOOK_URL=http://h AI_MEMORY_PROJECT_STRATEGY=repo-root /x/a
         assert_eq!(inferred.auth_token.as_deref(), Some("secret-token"));
     }
 
+    /// Prime-agent seeds the hooks install from its user-global settings.json
+    /// entry: the `url` yields the hook origin, while auth stays flag-driven —
+    /// the entry names `bearerTokenEnvVar` rather than embedding a literal
+    /// header, so there is no token to infer (the generated extension
+    /// resolves `AI_MEMORY_AUTH_TOKEN` at runtime instead).
+    #[test]
+    fn prime_agent_mcp_inference_supplies_hook_origin_without_token() {
+        assert_eq!(
+            mcp_client_for_agent(AgentChoice::PrimeAgent),
+            Some(McpClient::PrimeAgent)
+        );
+        let inferred = infer_json_mcp_config(
+            r#"{
+              "mcpServers": {
+                "ai-memory": {
+                  "type": "http",
+                  "url": "http://homelab:49374/mcp",
+                  "bearerTokenEnvVar": "AI_MEMORY_AUTH_TOKEN",
+                  "enabledTools": ["memory_query", "memory_read_page"]
+                }
+              }
+            }"#,
+            &["mcpServers", "ai-memory"],
+            "url",
+        )
+        .unwrap();
+
+        assert_eq!(
+            inferred.hook_server_url.as_deref(),
+            Some("http://homelab:49374")
+        );
+        assert!(inferred.auth_token.is_none());
+    }
+
     #[test]
     fn hook_server_url_from_mcp_url_strips_query_and_suffix() {
         for (input, expected) in [
