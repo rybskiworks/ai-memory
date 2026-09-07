@@ -1285,16 +1285,27 @@ fn pi_mcp_apply_guidance(args: &InstallMcpArgs) -> String {
 }
 
 fn render_prime(args: &InstallMcpArgs) -> Result<String> {
-    let settings_path = prime_settings_path_in(std::env::var_os("PRIME_AGENT_CODING_AGENT_DIR"))?;
+    // Snippets name the portable `~/...` form like every other renderer
+    // (`~/.omp/...`, `~/.pi/...`); the relocated agent home only appears
+    // when `PRIME_AGENT_CODING_AGENT_DIR` actually relocates it.
+    let env_override = std::env::var_os("PRIME_AGENT_CODING_AGENT_DIR");
+    let relocated = env_override
+        .clone()
+        .is_some_and(|v| crate::commands::path_util::agent_config_home(Some(v)).is_some());
+    let settings_display = if relocated {
+        prime_settings_path_in(env_override)?.display().to_string()
+    } else {
+        "~/.prime/agent/settings.json".to_owned()
+    };
     let mut out = format!(
-        "# prime-agent — merge into {settings_path}:\n\
+        "# prime-agent — merge into {settings_display}:\n\
          #\n\
          # prime-agent reads generic MCP servers from the top-level\n\
          # `mcpServers` map of the user-global settings file (project\n\
          # `.prime/agent/settings.json` entries are ignored for execution).\n\
          # This is the model-invoked read faucet; lifecycle capture stays\n\
          # on the generated extension (`install-hooks --agent prime-agent`).\n",
-        settings_path = settings_path.display(),
+        settings_display = settings_display,
     );
     if args.auth_token.is_some() {
         out.push_str(
