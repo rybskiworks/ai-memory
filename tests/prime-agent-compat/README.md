@@ -73,30 +73,80 @@ of operating-system-wide network confinement.
 ```sh
 python3 -m unittest discover -s tests/prime-agent-compat -p 'test_*.py' -v
 /nix/store/NODE_24_15_0/bin/node tests/prime-agent-compat/loader.test.mjs
+/nix/store/NODE_24_15_0/bin/node tests/prime-agent-compat/session-support.test.mjs
 ```
 
 These tests cover isolation, refusal of missing/inexact inputs, owned-child
 shutdown, redaction and result classification. Their small synthetic objects
-are **not** Prime compatibility evidence. Only `run.py` imports the real loader
-and starts the real native service.
+are **not** Prime compatibility evidence. The runtime drivers below use the
+real loader and native service; the small oracle tests do not launch either.
 
-## Deliberately not covered yet
+## Two-session capture and FTS recall
 
-This first check does not claim actual `AgentSession` execution, faux-provider
+`session.py` accepts the same explicit input arguments as `run.py` and defaults
+to a 60-second session-child timeout (allowed range 20–60). It additionally
+requires the pinned tree's retained test harness, utilities and session source,
+workspace dist packages, and tsx 4.23.1. It checks their required source files
+against the raw pin before allocating any state. It does not install them.
+
+Run it by replacing `run.py` with `session.py` in the command above. The driver
+first runs the original loader contract unchanged, then the separate
+same-operator/same-project session case. A passing capture case **does not hide
+the unsupported-event loader failure**: the combined command still exits 1,
+with separate loader and session stages in the report. Missing inputs exit 2;
+infrastructure/cleanup failures exit 3.
+
+The session case uses Prime's actual retained `createHarness`,
+`loadExtensions`, `createTestResourceLoader` and in-process faux model provider.
+The native CLI-emitted extension is copied unchanged for two independently
+loaded sessions. Both have fresh private session directories, real distinct
+UUIDs, unique faux provider registrations, and explicit `.ai-memory.toml`
+markers for `prime-compat/shared-capture`. No ambient auth/settings/resources,
+default shell/IPython tools, automatic refinement, compaction or telemetry are
+enabled. An explicit scratch TypeScript configuration is passed to the pinned
+tsx loader; no root tsconfig or floating npm/npx command is assumed.
+
+Session A submits an actual prompt containing a harmless unique canary. A
+bounded explicit-scope native observation read establishes that its exact
+session/agent/cwd and prompt observation have committed; it does not create a
+page or fake a hook. A remains open. Session B's faux model then emits a real
+`memory_query` tool call through the generated bridge, with no scope arguments.
+The assertion checks the actual model-visible tool result and its call id,
+`hits=[]`, and a raw FTS hit matching A's precise committed observation id,
+session id, kind and canary snippet. A canary in a prompt, a canned page, or
+another session's result cannot satisfy that assertion. The bridge must forward
+B's real session id and the unmodified query arguments. Raw hits do not carry
+workspace/project fields; scope is correlated through the explicit native
+diagnostic and the emitted marker/cwd evidence.
+
+The fixture activates only the actual `memory_query` tool for its model turns.
+This is test scope, **not a change or recommendation for the production default
+tool surface**. Only in-process faux responses run; there is no model HTTP
+server, paid provider call, Prime CLI/daemon, Python kernel or VM.
+
+Finally it uses Prime's real shutdown-event helper, observes eventual native
+session-end ingestion, disposes each actual session, and unregisters its faux
+provider. Disposal and unregistering are attempted independently even when
+shutdown or the storage diagnostic fails. The private session directories and
+transcripts remain under the retained artifact root; upstream harness cleanup
+is not called because its synchronous removal retries can exceed the deadline.
+The native service remains supervised by the shared exact-child cleanup.
+These healthy-service waits **do not prove a bounded/durable shutdown-drain
+contract**; that remains explicitly `not_tested` in the report.
+
+## Coverage limits
+
+The loader-only `run.py` does not claim actual `AgentSession` execution, faux-provider
 turns, prompt/tool capture, session/project identity, subsequent-session recall,
 refinement, shutdown queue delivery, native Python MCP, CLI startup or fleet
 deployment. The report explicitly marks session capture and CLI execution as
 `not_run`, even when the loader contract passes.
 
-The next source-owned test should use the pinned
-`packages/coding-agent/test/suite/harness.ts` (`AgentSession` and
-`registerFauxProvider`) with the installer-emitted extension, fresh marker scope
-and the same native service. It must assert server-ingested actor/session/project
-and retrieve an actual captured canary, without pre-writing that canary as a
-page. Any source test imports need an explicit scratch TypeScript configuration:
-the reviewed built tree need not include root `tsconfig*.json`. Keep actual
-client/image deployment checks downstream, and do not maintain a second adapter
-implementation in those tests.
+The two-session case covers only the one operator and explicit shared project.
+It does not prove interleaved project/actor isolation, real refinement,
+stateful MCP/SSE, native Python MCP ownership, outage/spool/replay/overflow,
+shutdown durability, CLI startup, or fleet deployment. Those checks must remain
+separate, with no second adapter implementation in downstream fixtures.
 
 This directory is test-only and outside the native package source fileset. Its
 addition does not change the already built native service or the upstream Rust

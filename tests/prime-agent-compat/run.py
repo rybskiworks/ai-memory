@@ -133,7 +133,28 @@ def server_status(port, token):
         connection.close()
 
 
-def execute(args):
+def run_loader(args, root, env, extension, url):
+    input_file = root / "loader-input.json"
+    result_file = root / "loader-result.json"
+    input_file.write_text(json.dumps({
+        "prime_source": str(args.prime_source), "prime_tree": str(args.prime_tree),
+        "extension": str(extension), "project": str(root / "project"),
+        "server_url": url, "result_file": str(result_file),
+        "discovery_timeout_ms": max(100, (args.timeout - 2) * 1000),
+    }))
+    try:
+        loaded = command([args.node, ROOT / "loader.mjs", input_file], root / "project", env, args.timeout)
+    except subprocess.CalledProcessError as error:
+        loaded = error
+    token = env["AI_MEMORY_AUTH_TOKEN"]
+    (root / "loader.log").write_text((loaded.stdout + loaded.stderr).replace(token, "<redacted>"))
+    if not result_file.is_file():
+        raise RuntimeError("loader exited without a completed result")
+    result = redact(json.loads(result_file.read_text()), token)
+    return {"loader": result, "loader_exit": loaded.returncode, "status": loader_status(result, loaded.returncode)}
+
+
+def execute(args, check=run_loader):
     preflight(args)  # Missing builds must fail before any service/config creation.
     root = Path(tempfile.mkdtemp(prefix="ai-memory-prime-compat-")).resolve()
     for directory in ("home", "memory-home", "prime", "config", "cache", "xdg-data", "state", "tmp", "project"):
@@ -192,25 +213,7 @@ def execute(args):
             ], root / "project", env, args.timeout)
             (root / "installer.log").write_text((installed.stdout + installed.stderr).replace(token, "<redacted>"))
             report["extension_sha256"] = sha256(extension)
-            input_file = root / "loader-input.json"
-            result_file = root / "loader-result.json"
-            input_file.write_text(json.dumps({
-                "prime_source": str(args.prime_source), "prime_tree": str(args.prime_tree),
-                "extension": str(extension), "project": str(root / "project"),
-                "server_url": url, "result_file": str(result_file),
-                "discovery_timeout_ms": max(100, (args.timeout - 2) * 1000),
-            }))
-            try:
-                loaded = command([args.node, ROOT / "loader.mjs", input_file], root / "project", env, args.timeout)
-                report["loader_exit"] = loaded.returncode
-            except subprocess.CalledProcessError as error:
-                loaded = error
-                report["loader_exit"] = error.returncode
-            (root / "loader.log").write_text((loaded.stdout + loaded.stderr).replace(token, "<redacted>"))
-            if not result_file.is_file():
-                raise RuntimeError("loader exited without a completed result")
-            report["loader"] = redact(json.loads(result_file.read_text()), token)
-            report["status"] = loader_status(report["loader"], report["loader_exit"])
+            report.update(check(args, root, env, extension, url))
             if (data / "models").exists():
                 raise RuntimeError("disabled embeddings created model state")
     except PrerequisiteError as error:
