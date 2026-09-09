@@ -124,6 +124,12 @@ legacy long snippets between `<!-- ai-memory:start -->` /
 `<!-- ai-memory:end -->` are replaced in place with the slim snippet, and
 managed Agent Skills are installed or updated alongside it.
 
+If you install into `AGENTS.md` and the project is also used from Claude Code,
+make `CLAUDE.md` import it with a bare `@AGENTS.md` first line. Claude Code
+loads `CLAUDE.md` and does not read `AGENTS.md`, so without that import the
+installed block is absent from context at session start. See
+[Claude Code memory](https://code.claude.com/docs/en/memory#agents-md).
+
 ---
 
 ## Configuring the CLI URL and auth
@@ -1275,6 +1281,11 @@ completion with the session identity through ai-memory's extension channel
 (`event=other`, `source_event=refine_complete`). It does not capture the
 refinement summary or edits. Prime's local/global refinement scope describes
 its harness settings, not the memory project's scope or authorization.
+
+The asynchronous `session_shutdown` handler posts `session-end` and awaits the
+shared hook queue for up to two seconds before returning. This bounded drain
+coexists with refinement capture; it is best-effort delivery, not a guarantee
+that every queued observation has committed before the harness exits.
 
 ### Bind mounts vs docker cp
 

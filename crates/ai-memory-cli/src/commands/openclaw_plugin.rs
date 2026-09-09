@@ -215,15 +215,21 @@ pub(crate) fn manifest_json() -> String {
 /// default when no marker pins a `project_strategy` (#128); a marker's own
 /// `project` / `project_strategy` still win (§3.3). Mirrors the opencode/omp
 /// `ts_apply_marker_params` in `install_hooks.rs`.
+///
+/// Scope/settings resolution walks past a capture-only marker to the nearest
+/// ancestor marker that declares a setting (#668) via `findSettingsMarker`
+/// (`TS_FIND_SETTINGS_MARKER`, shared with `ts_apply_marker_params` so both
+/// copies stay equivalent).
 fn apply_marker_params_ts(default_strategy: Option<&str>) -> String {
     let toml_flag = super::install_hooks::TS_TOML_FLAG;
+    let find_settings_marker = super::install_hooks::TS_FIND_SETTINGS_MARKER;
     let Some(default) = default_strategy else {
         return format!(
-            "{toml_flag}\n{}",
+            "{toml_flag}\n{find_settings_marker}\n{}",
             r#"function applyMarkerParams(url: URL, cwd: string | undefined): void {
   if (!cwd) return;
   url.searchParams.set("cwd", cwd);
-  const marker = findMarker(cwd);
+  const marker = findSettingsMarker(cwd);
   if (!marker) return;
   try {
     const body = readFileSync(marker, "utf8");
@@ -266,7 +272,7 @@ fn apply_marker_params_ts(default_strategy: Option<&str>) -> String {
   let defaultGlobal: string | undefined;
   let briefing: string | undefined;
   let briefingBudget: string | undefined;
-  const marker = findMarker(cwd);
+  const marker = findSettingsMarker(cwd);
   if (marker) {
     try {
       const body = readFileSync(marker, "utf8");
@@ -301,7 +307,7 @@ fn apply_marker_params_ts(default_strategy: Option<&str>) -> String {
   if (briefingBudget) url.searchParams.set("briefing_budget", briefingBudget);
 }"#;
     format!(
-        "const DEFAULT_PROJECT_STRATEGY = {};\n{toml_flag}\n{body}",
+        "const DEFAULT_PROJECT_STRATEGY = {};\n{toml_flag}\n{find_settings_marker}\n{body}",
         ts_string_literal(default)
     )
 }
@@ -444,6 +450,28 @@ const startedSessions = new Set<string>();
 const handoffChecked = new Set<string>();
 const preCompactLast = new Map<string, number>();
 
+const HOOK_DISPOSE_DRAIN_BUDGET_MS = 2000;
+const pendingHookRequests = new Set<Promise<void>>();
+
+function trackHookRequest(request: Promise<void>): void {{
+  pendingHookRequests.add(request);
+  void request.finally(() => pendingHookRequests.delete(request));
+}}
+
+function disposeDrainTimeout(): Promise<void> {{
+  return new Promise((resolve) => {{
+    const timer = setTimeout(resolve, HOOK_DISPOSE_DRAIN_BUDGET_MS);
+    timer.unref?.();
+  }});
+}}
+
+async function drainHookQueueForDispose(): Promise<void> {{
+  await Promise.race([
+    Promise.allSettled(Array.from(pendingHookRequests)),
+    disposeDrainTimeout(),
+  ]);
+}}
+
 function rememberSession(event: any, ctx: any): void {{
   const id = sessionID(event, ctx);
   if (!id || startedSessions.has(id)) return;
@@ -472,7 +500,9 @@ function postPreCompact(event: any, ctx: any): void {{
     // Fire-and-forget, but never silent loss: an unreachable server or
     // 5xx spools the event in the CLI hook-spool format for a later
     // drain (#580); a delivered post opportunistically drains backlog.
-    void fetch(url, {{
+    // Tracked in pendingHookRequests so session_end can await a bounded
+    // flush instead of letting teardown kill the in-flight fetch (#676).
+    const request = fetch(url, {{
       method: "POST",
       headers: {{ "Content-Type": "application/json", ...authHeaders() }},
       body: JSON.stringify(policy.payload),
@@ -484,6 +514,7 @@ function postPreCompact(event: any, ctx: any): void {{
         else requestSpoolDrain();
       }})
       .catch(() => undefined);
+    trackHookRequest(request);
   }} catch (_e) {{
     try {{ spoolFailedHook(url, policy.payload); }} catch (_e2) {{}}
   }}
@@ -517,9 +548,10 @@ export default definePluginEntry({{
       rememberSession(event, ctx);
     }});
 
-    api.on("session_end", (event: any, ctx: any) => {{
+    api.on("session_end", async (event: any, ctx: any) => {{
       rememberSession(event, ctx);
       postHook("session-end", payload(event, ctx, {{ reason: event?.reason }}));
+      await drainHookQueueForDispose();
     }});
 
     api.on("before_prompt_build", async (event: any, ctx: any) => {{
@@ -621,6 +653,19 @@ mod tests {
         assert!(plugin.contains("definePluginEntry"));
         assert!(plugin.contains("api.on(\"session_start\""));
         assert!(plugin.contains("api.on(\"session_end\""));
+        // #676: session_end must be async and await a bounded flush of the
+        // in-flight postHook fetch, otherwise the gateway tears the plugin
+        // down before the session-end request reaches the server.
+        assert!(plugin.contains("const HOOK_DISPOSE_DRAIN_BUDGET_MS = 2000;"));
+        assert!(plugin.contains("function disposeDrainTimeout(): Promise<void>"));
+        assert!(plugin.contains("async function drainHookQueueForDispose(): Promise<void>"));
+        assert!(plugin.contains("function trackHookRequest("));
+        assert!(plugin.contains("api.on(\"session_end\", async (event: any, ctx: any) => {"));
+        assert!(plugin.contains("await drainHookQueueForDispose();"));
+        assert!(
+            !plugin.contains("api.on(\"session_end\", (event: any, ctx: any) => {"),
+            "session_end must not regress to the sync fire-and-forget form: {plugin}"
+        );
         assert!(plugin.contains("api.on(\"before_prompt_build\""));
         assert!(plugin.contains("api.on(\"before_tool_call\""));
         assert!(plugin.contains("api.on(\"after_tool_call\""));
@@ -636,6 +681,16 @@ mod tests {
         assert!(plugin.contains("tomlFlag(body, \"default_global\")"));
         assert!(plugin.contains("tomlFlag(body, \"inject_on_session_start\")"));
         assert!(plugin.contains("url.searchParams.set(\"briefing_budget\", briefingBudget)"));
+        // #668: same settings-walk as the shared ts_apply_marker_params
+        // (install_hooks.rs) — the two applyMarkerParams copies stay
+        // equivalent, so a nested capture-only marker does not shadow an
+        // outer marker's scope here either.
+        assert!(plugin.contains("function findSettingsMarker"));
+        assert!(plugin.contains("function declaresSettings"));
+        assert!(plugin.contains("const marker = findSettingsMarker(cwd);"));
+        assert!(
+            plugin.contains("if (declaresSettings(readFileSync(marker, \"utf8\"))) return marker;")
+        );
         assert!(plugin.contains("import { execFileSync } from \"node:child_process\";"));
         assert!(
             plugin.contains("import { basename, dirname, join, resolve, sep } from \"node:path\";")
@@ -685,6 +740,10 @@ mod tests {
         assert!(
             plugin.contains("if (!projectStrategy) projectStrategy = DEFAULT_PROJECT_STRATEGY;"),
             "must apply the default when a marker pins no strategy: {plugin}"
+        );
+        assert!(
+            plugin.contains("const marker = findSettingsMarker(cwd);"),
+            "the default-strategy variant must also walk past a capture-only marker (#668): {plugin}"
         );
     }
 
