@@ -9,7 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 - Added locked native Nix packaging with a shared Rust toolchain, core-library
-  tests, and an isolated provider-free HTTP/MCP package check.
+  tests, and an isolated provider-free HTTP/MCP package check. (#2)
 - Prime-agent lifecycle capture and MCP tools via a generated TypeScript
   extension. `install-hooks --agent prime-agent --apply` (alias `prime`)
   writes `~/.prime/agent/extensions/ai-memory-prime-agent.ts` (or
