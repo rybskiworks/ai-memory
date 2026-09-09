@@ -1516,6 +1516,58 @@ local-data directory on Windows, typically
 To require bearer-token auth, set `AI_MEMORY_AUTH_TOKEN` in the
 server's environment.
 
+### Nix source builds and development
+
+The fork's flake builds the native binary from the checked-out source and
+`Cargo.lock`; it does not wrap or download a Docker release. `flake.lock`
+pins the shared `nix-tooling` input, which owns the Nixpkgs and Fenix
+revisions. Nix builds, the development shell, and the Rust formatting check
+use Rust **1.97.1**. The unchanged `rust-toolchain.toml` and Cargo MSRV remain
+the **1.95** contract for non-Nix development and upstream compatibility;
+passing the Nix checks is not evidence of a Rust 1.95 build.
+
+From the repository root:
+
+```bash
+nix flake check --no-build --no-update-lock-file
+nix build --no-update-lock-file
+nix run --no-update-lock-file . -- --version
+nix build --no-update-lock-file .#checks.x86_64-linux.native-service
+nix build --no-update-lock-file .#checks.x86_64-linux.rustfmt
+nix develop --no-update-lock-file -c cargo --version
+```
+
+The default package includes `cargo test --package ai-memory-core --lib`.
+The `native-service` check runs the installed binary in fresh temporary
+HOME, XDG and data directories, with an ephemeral bearer token and a
+loopback-only listener. It checks version and bundled assets, HTTP bearer
+and Host rejection, disabled provider health, MCP initialization/tool
+listing, and a scoped write followed by FTS retrieval. It stops and reaps
+only its own server before removing the temporary state. No installed
+client, provider credentials, model, existing database or Docker daemon is
+used. Run with Nix sandboxing enabled to deny external network access.
+
+These are bounded native packaging checks, **not** the full workspace,
+Docker-wrapper, companion, cross-platform or live-provider acceptance
+suite. Before upstream handoff, also run the contributor guide's formatter,
+Clippy, full workspace tests and dependency-policy gates; run companion
+tests with their separate manifest. Outputs remain available for Linux and
+macOS on x86-64 and ARM64; each platform needs its own build verification.
+
+Nix builds use the committed Tailwind stylesheet (`TAILWIND_BUILD=0`).
+Stylesheet regeneration and freshness validation remain the existing
+explicit maintenance workflow. Runtime local embeddings are a different
+concern: their default can fetch a model even without an API key. For an
+offline server, put `embedding_provider = "none"` at the **root** of its
+configuration, keep LLM providers unset, and disable scheduled maintenance
+when appropriate. The package check supplies these settings explicitly;
+it does not change normal service defaults or install a service.
+
+Update shared tool revisions deliberately in `flake.nix`, regenerate
+`flake.lock` with `nix flake lock`, and review/build the resulting package
+and checks before publishing the new pin. Ordinary build and development
+commands above refuse implicit lock updates.
+
 #### Optional serve flags
 
 The `serve` subcommand also accepts:
