@@ -28,7 +28,10 @@ managed `ai-memory run` launches add the portable visible-event ledger. Do not
 manually write routine notes. Only write durable memory when the user explicitly asks
 to remember or annotate something permanently. For an explicitly time-bounded note,
 set `expires_at`; expired pages are hidden from normal reads and deleted by the next
-forget sweep, and a TTL outranks `pinned`.
+forget sweep, and a TTL outranks `pinned`. ai-memory is the cross-harness memory of
+record for this project: if the harness you run in has its own local memory feature,
+do not keep durable project facts there in parallel — a harness-local store is
+invisible to every other agent and fragments continuity, so capture them here instead.
 
 For ranking diagnosis, opt-in query explanations add bounded score provenance
 to project/scopes hits. Cross-project search uses a distinct FTS-only ranker
@@ -66,6 +69,11 @@ Y", "all PRs must ..."), write it in the project's canonical agent instruction f
 Many projects use CLAUDE.md for Claude Code and
 AGENTS.md for Codex / OpenCode / OpenCode 2 / Cursor / Gemini CLI / Grok Build CLI / Kimi Code / Kiro CLI / Command Code,
 but if the project says one file is canonical, use that file.
+
+Claude Code loads `CLAUDE.md` and does not read `AGENTS.md`. In a project
+where `AGENTS.md` is canonical, give `CLAUDE.md` a bare `@AGENTS.md` import
+line. Without it a rule written to `AGENTS.md` is absent from context at
+session start and reaches Claude Code only if the agent opens the file.
 
 If the rule is a standing *user/team* preference that should apply to
 every project (tech choices, code style, personal conventions), save it
@@ -459,7 +467,7 @@ Additional boundary rules:
 - **Auth ladder:** static root bearer token → DB-user tokens
   (attribution only, no admin) → OIDC device tokens at the hook edge.
   `/admin/*` becomes root-only the moment the first DB user exists.
-- **Dependency policy:** `cargo deny check --all-features` and
+- **Dependency policy:** `cargo deny --all-features check` and
   `cargo audit` run in CI; do not add dependencies without checking the
   project doesn't already have the capability, and match existing
   versions/idioms.
