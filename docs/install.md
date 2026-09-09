@@ -2379,6 +2379,12 @@ image, re-stages hook scripts under
 prints how to restart the server container so the new binary is used.
 Re-running `install-hooks --apply` remains idempotent: ai-memory
 replaces only the hook entries it owns and leaves unrelated hooks alone.
+Native command-string hooks also recognize a renamed binary when installation,
+reinstallation and removal use the same executable path. Recognition requires
+that exact generated executable prefix and the native hook flags; an unrelated
+command mentioning the path in an argument is not adopted. If a renamed binary
+is moved, review its old hook entries rather than assuming another executable
+path can identify them automatically.
 When a Compose file is found, the wrapper first verifies that its project owns
 the running `ai-memory` container. A standalone container is never handed to an
 unrelated Compose project just because its file occupies a conventional path;

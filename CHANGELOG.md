@@ -23,6 +23,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   entry it added.
 
 ### Fixed
+- Kept native hook reinstallation and removal consistent for renamed binaries
+  by recognizing the exact running executable and hook command signature,
+  without matching unrelated executable names or argument paths. (#3)
 - Removed the unsupported Prime-agent `session_before_refine` subscription
   from the generated extension, retaining session-scoped `refine_complete`
   capture through the extension channel. (#3)

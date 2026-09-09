@@ -738,14 +738,26 @@ fn strip_legacy_orphan_tail(tail: &str) -> &str {
 /// Keep both signatures narrow so hook overlays and uninstall do not remove
 /// unrelated hooks that happen to use the same event names or script basenames.
 pub(crate) fn hook_command_is_ours(command: &str) -> bool {
+    let exe = std::env::current_exe().ok();
+    hook_command_is_ours_with_exe(command, exe.as_deref())
+}
+
+fn hook_command_is_ours_with_exe(command: &str, exe: Option<&Path>) -> bool {
     if command.contains("AI_MEMORY_HOOK_URL=") {
         return true;
     }
     let lower = command.to_ascii_lowercase();
-    lower.contains("ai-memory")
-        && lower.contains(" hook --event ")
+    if !(lower.contains(" hook --event ")
         && lower.contains(" --agent ")
-        && lower.contains(" --server-url ")
+        && lower.contains(" --server-url "))
+    {
+        return false;
+    }
+    // Native installation renders current_exe, which need not retain the
+    // package name. Match that exact generated executable prefix rather than
+    // broadening the name heuristic to arbitrary paths or argument values.
+    lower.contains("ai-memory")
+        || exe.is_some_and(|exe| super::render_shared::native_hook_command_uses_exe(command, exe))
 }
 
 fn hook_entry_is_ours(entry: &serde_json::Value) -> bool {
@@ -1542,6 +1554,112 @@ mod tests {
         assert!(!hook_command_is_ours(
             "/usr/local/bin/something hook --event stop --agent claude-code --server-url http://h"
         ));
+    }
+
+    #[test]
+    #[cfg(not(windows))]
+    fn hook_signature_matches_exact_renamed_executable_quoting() {
+        for (exe, command) in [
+            (
+                "/opt/native/ai_memory-0123456789abcdef",
+                "/opt/native/ai_memory-0123456789abcdef --data-dir /tmp/state hook --event stop --agent cursor --server-url http://h",
+            ),
+            (
+                "/opt/custom tools/remember",
+                "'/opt/custom tools/remember' hook --event stop --agent cursor --server-url http://h",
+            ),
+            (
+                "/opt/alice's tools/remember",
+                "'/opt/alice'\\''s tools/remember' --data-dir /tmp/state hook --event stop --agent cursor --server-url http://h",
+            ),
+            (
+                "/opt/custom\"tools/remember",
+                "'/opt/custom\"tools/remember' hook --event stop --agent cursor --server-url http://h",
+            ),
+        ] {
+            assert!(
+                hook_command_is_ours_with_exe(command, Some(Path::new(exe))),
+                "exact generated executable must be recognized: {command}"
+            );
+            assert!(
+                !hook_command_is_ours_with_exe(command, Some(Path::new("/different/remember"))),
+                "another executable must not adopt this command: {command}"
+            );
+            assert!(!hook_command_is_ours_with_exe(command, None));
+        }
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn hook_signature_matches_exact_renamed_windows_executable_quoting() {
+        for (exe, command) in [
+            (
+                r"C:\custom tools\remember.exe",
+                r#""C:\custom tools\remember.exe" hook --event stop --agent cursor --server-url "http://h""#,
+            ),
+            (
+                r"C:\custom tools\remember.exe",
+                r#"& "C:\custom tools\remember.exe" --data-dir "C:\state" hook --event stop --agent codex --server-url "http://h""#,
+            ),
+            (
+                r"C:\native\remember.exe",
+                r"C:\native\remember.exe hook --event stop --agent antigravity-cli --server-url http://h",
+            ),
+        ] {
+            assert!(
+                hook_command_is_ours_with_exe(command, Some(Path::new(exe))),
+                "exact generated executable must be recognized: {command}"
+            );
+            assert!(
+                !hook_command_is_ours_with_exe(command, Some(Path::new("/different/remember"))),
+                "another executable must not adopt this command: {command}"
+            );
+            assert!(!hook_command_is_ours_with_exe(command, None));
+        }
+    }
+
+    #[test]
+    fn hook_signature_exact_exe_rejects_argument_and_prefix_lookalikes() {
+        let exe = Path::new("/opt/native/ai_memory");
+        for command in [
+            "/opt/native/ai_memory-helper hook --event stop --agent cursor --server-url http://h",
+            "/opt/native/ai_memory/other hook --event stop --agent cursor --server-url http://h",
+            "/opt/native/helper --data-dir /opt/native/ai_memory hook --event stop --agent cursor --server-url http://h",
+            "echo /opt/native/ai_memory hook --event stop --agent cursor --server-url http://h",
+            "/opt/native/ai_memory boot --agent cursor --server-url http://h",
+            "/opt/native/ai_memory hook --event stop --server-url http://h",
+            "/opt/native/ai_memory hook --event stop --agent cursor",
+            "/opt/native/AI_MEMORY hook --event stop --agent cursor --server-url http://h",
+        ] {
+            assert!(
+                !hook_command_is_ours_with_exe(command, Some(exe)),
+                "unrelated or incomplete command must survive: {command}"
+            );
+        }
+        assert!(!hook_command_is_ours_with_exe(
+            " hook --event stop --agent cursor --server-url http://h",
+            Some(Path::new("")),
+        ));
+    }
+
+    #[test]
+    #[cfg(not(windows))]
+    fn hook_signature_exact_exe_rejects_other_platform_quoting() {
+        for (exe, command) in [
+            (
+                "/opt/custom tools/remember",
+                "/opt/custom tools/remember hook --event stop --agent cursor --server-url http://h",
+            ),
+            (
+                "/opt/custom\"tools/remember",
+                "\"/opt/customtools/remember\" hook --event stop --agent cursor --server-url http://h",
+            ),
+        ] {
+            assert!(!hook_command_is_ours_with_exe(
+                command,
+                Some(Path::new(exe))
+            ));
+        }
     }
 
     #[test]
