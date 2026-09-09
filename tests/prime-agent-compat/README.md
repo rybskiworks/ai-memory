@@ -57,11 +57,16 @@ not proof of tool readiness before a first model prompt. The driver requires
 `memory_query` and `memory_read_page` to appear but **does not choose a read-only
 or full-tool policy**. Extra tools are reported, not silently removed.
 
-The current generated `session_before_refine` subscription is absent from this
-Prime API. It must make this check red; do not add it to a fake event list or
-turn a failure into an expected-success assertion. The generated adapter is not
-modified by this harness. Its supported `refine_complete` event is a separate
-capture contract to exercise next.
+The earlier generated `session_before_refine` subscription was absent from this
+Prime API and correctly made this check fail. Source
+`c8f2702b3dd013cb097c6881a8e44e0c6f457957` removed that subscription; its native
+package passed the actual loader and the two-session capture/recall check below
+against the pinned Prime tree. Those results do not certify a later native
+binary merely because it reports the same version. Unsupported subscriptions
+must still fail; do not add them to a fake event list or turn a failure into an
+expected-success assertion. This harness never modifies the generated adapter.
+Delivery of the supported `refine_complete` event remains a separate capture
+contract, not coverage established by the prompt/recall case.
 
 The wrapper rejects generated-extension `fetch` requests outside the exact
 native fixture origin and known MCP/hook/handoff paths while forwarding real
@@ -92,9 +97,9 @@ against the raw pin before allocating any state. It does not install them.
 Run it by replacing `run.py` with `session.py` in the command above. The driver
 first runs the original loader contract unchanged, then the separate
 same-operator/same-project session case. A passing capture case **does not hide
-the unsupported-event loader failure**: the combined command still exits 1,
-with separate loader and session stages in the report. Missing inputs exit 2;
-infrastructure/cleanup failures exit 3.
+any loader compatibility failure**: if either contract fails, the combined
+command exits 1, with separate loader and session stages in the report. Missing
+inputs exit 2; infrastructure/cleanup failures exit 3.
 
 The session case uses Prime's actual retained `createHarness`,
 `loadExtensions`, `createTestResourceLoader` and in-process faux model provider.
