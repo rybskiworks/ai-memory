@@ -2385,6 +2385,16 @@ that exact generated executable prefix and the native hook flags; an unrelated
 command mentioning the path in an argument is not adopted. If a renamed binary
 is moved, review its old hook entries rather than assuming another executable
 path can identify them automatically.
+
+Shared PowerShell support scripts staged by `install-hooks` are replaced
+atomically without inheriting a read-only bundle's permissions, so native
+installation can be repeated against an immutable Nix package. Identical
+support files are left untouched. Symlinks at the managed support file or
+its `lib/` directory are refused without modifying their targets; this does
+not change support for symlinked agent configuration files. On Windows, a
+changed legacy destination explicitly marked read-only can still be refused
+by the filesystem; installation does not clear that attribute automatically.
+
 When a Compose file is found, the wrapper first verifies that its project owns
 the running `ai-memory` container. A standalone container is never handed to an
 unrelated Compose project just because its file occupies a conventional path;

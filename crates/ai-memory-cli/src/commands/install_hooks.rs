@@ -4910,6 +4910,12 @@ fn copy_support_hook_scripts(source_dir: &Path, dest_root: &Path) -> Result<()> 
         return Ok(());
     };
     let dest_lib = dest_hooks_root.join("lib");
+    if dest_lib.is_symlink() {
+        anyhow::bail!(
+            "refusing to stage hook support scripts through symlink {}",
+            dest_lib.display()
+        );
+    }
     fs::create_dir_all(&dest_lib)
         .with_context(|| format!("creating hook support dir {}", dest_lib.display()))?;
     for entry in fs::read_dir(&source_lib)
@@ -4921,8 +4927,26 @@ fn copy_support_hook_scripts(source_dir: &Path, dest_root: &Path) -> Result<()> 
             continue;
         }
         let to = dest_lib.join(from.file_name().context("bad support file name")?);
-        fs::copy(&from, &to)
-            .with_context(|| format!("copying {} → {}", from.display(), to.display()))?;
+        // These are managed bundle assets, not user configuration symlinks.
+        // Never follow a destination link or copy immutable source permissions
+        // onto the staged file: a later install must be able to replace it.
+        if to.is_symlink() {
+            anyhow::bail!(
+                "refusing to stage hook support script through symlink {}",
+                to.display()
+            );
+        }
+        let bytes = fs::read(&from).with_context(|| format!("reading {}", from.display()))?;
+        match fs::read(&to) {
+            Ok(existing) if existing == bytes => continue,
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(error).with_context(|| format!("reading {}", to.display()));
+            }
+        }
+        ai_memory_wiki::write_atomic(&to, &bytes)
+            .with_context(|| format!("staging {} → {}", from.display(), to.display()))?;
     }
     Ok(())
 }
@@ -7787,6 +7811,198 @@ model = "gpt-5"
             lib.contains("shared helper"),
             "staged _lib.sh must match the source-of-truth"
         );
+    }
+
+    #[test]
+    fn copy_support_hook_scripts_reinstalls_and_updates_support_bundles() {
+        let tmp = TempDir::new().unwrap();
+        let first = tmp.path().join("bundle-v1/cursor");
+        let next = tmp.path().join("bundle-v2/cursor");
+        for (source, content) in [(&first, "# first\n"), (&next, "# second\n")] {
+            fs::create_dir_all(source).unwrap();
+            let lib = source.parent().unwrap().join("lib");
+            fs::create_dir(&lib).unwrap();
+            fs::write(lib.join("shared.ps1"), content).unwrap();
+        }
+        let dest = tmp.path().join("data/hooks/cursor");
+        let support_dir = dest.parent().unwrap().join("lib");
+        fs::create_dir_all(&support_dir).unwrap();
+        let unrelated = support_dir.join("third-party.ps1");
+        fs::write(&unrelated, b"# keep this helper\n").unwrap();
+
+        for (source, expected) in [
+            (&first, "# first\n"),
+            (&first, "# first\n"),
+            (&next, "# second\n"),
+        ] {
+            copy_support_hook_scripts(source, &dest).unwrap();
+            assert_eq!(
+                fs::read_to_string(support_dir.join("shared.ps1")).unwrap(),
+                expected
+            );
+            assert_eq!(fs::read(&unrelated).unwrap(), b"# keep this helper\n");
+            assert_eq!(fs::read_dir(&support_dir).unwrap().count(), 2);
+        }
+        for (source, expected) in [(&first, "# first\n"), (&next, "# second\n")] {
+            assert_eq!(
+                fs::read_to_string(source.parent().unwrap().join("lib/shared.ps1")).unwrap(),
+                expected
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    fn readonly_support_bundle(root: &Path, content: &[u8]) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+
+        let agent = root.join("cursor");
+        fs::create_dir_all(&agent).unwrap();
+        fs::create_dir_all(root.join("lib")).unwrap();
+        stub_scripts(&agent, &["session-start.sh"]);
+        let support = root.join("lib/shared.ps1");
+        fs::write(&support, content).unwrap();
+        for path in [support, agent.join("session-start.sh")] {
+            fs::set_permissions(path, fs::Permissions::from_mode(0o444)).unwrap();
+        }
+        agent
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stage_hook_scripts_reinstalls_and_updates_readonly_support_bundles() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+        let tmp = TempDir::new().unwrap();
+        let first = readonly_support_bundle(&tmp.path().join("bundle-v1"), b"# first\n");
+        let next = readonly_support_bundle(&tmp.path().join("bundle-v2"), b"# second\n");
+        let data = tmp.path().join("data");
+        let support_dir = data.join("hooks/lib");
+        fs::create_dir_all(&support_dir).unwrap();
+        let unrelated = support_dir.join("third-party.ps1");
+        fs::write(&unrelated, b"# keep this helper\n").unwrap();
+        let target = support_dir.join("shared.ps1");
+
+        stage_hook_scripts_in(&first, "cursor", &data).unwrap();
+        assert_eq!(fs::read(&target).unwrap(), b"# first\n");
+        assert!(
+            !fs::metadata(&target).unwrap().permissions().readonly(),
+            "staged helpers must not inherit immutable source permissions"
+        );
+        let original_inode = fs::metadata(&target).unwrap().ino();
+        stage_hook_scripts_in(&first, "cursor", &data).unwrap();
+        assert_eq!(fs::read(&target).unwrap(), b"# first\n");
+        assert_eq!(
+            fs::metadata(&target).unwrap().ino(),
+            original_inode,
+            "identical support files must not be rewritten"
+        );
+        stage_hook_scripts_in(&next, "cursor", &data).unwrap();
+        assert_eq!(fs::read(&target).unwrap(), b"# second\n");
+        assert_ne!(fs::metadata(&target).unwrap().ino(), original_inode);
+        assert_eq!(fs::read(&unrelated).unwrap(), b"# keep this helper\n");
+        for (source, expected) in [(&first, b"# first\n".as_slice()), (&next, b"# second\n")] {
+            let support = source.parent().unwrap().join("lib/shared.ps1");
+            assert_eq!(fs::read(&support).unwrap(), expected);
+            assert_eq!(
+                fs::metadata(&support).unwrap().permissions().mode() & 0o777,
+                0o444
+            );
+        }
+        assert_eq!(fs::read_dir(&support_dir).unwrap().count(), 2);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn copy_support_hook_scripts_replaces_readonly_destination_without_mutating_old_inode() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+        let tmp = TempDir::new().unwrap();
+        let source = readonly_support_bundle(&tmp.path().join("bundle"), b"# update\n");
+        let dest = tmp.path().join("data/hooks/cursor");
+        let support_dir = dest.parent().unwrap().join("lib");
+        fs::create_dir_all(&support_dir).unwrap();
+        let target = support_dir.join("shared.ps1");
+        fs::write(&target, b"# prior install\n").unwrap();
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o444)).unwrap();
+        let outside = tmp.path().join("old-inode.ps1");
+        fs::hard_link(&target, &outside).unwrap();
+
+        copy_support_hook_scripts(&source, &dest).unwrap();
+
+        assert_eq!(fs::read(&target).unwrap(), b"# update\n");
+        assert_eq!(fs::read(&outside).unwrap(), b"# prior install\n");
+        assert_eq!(
+            fs::metadata(&outside).unwrap().permissions().mode() & 0o777,
+            0o444
+        );
+        assert_ne!(
+            fs::metadata(&target).unwrap().ino(),
+            fs::metadata(&outside).unwrap().ino()
+        );
+        assert!(!fs::metadata(&target).unwrap().permissions().readonly());
+        assert_eq!(fs::read_dir(&support_dir).unwrap().count(), 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn copy_support_hook_scripts_rejects_existing_and_dangling_destination_symlinks() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = TempDir::new().unwrap();
+        let source = readonly_support_bundle(&tmp.path().join("bundle"), b"# managed\n");
+        for exists in [true, false] {
+            let root = tmp
+                .path()
+                .join(if exists { "existing" } else { "dangling" });
+            let support_dir = root.join("hooks/lib");
+            fs::create_dir_all(&support_dir).unwrap();
+            let outside = root.join("outside.ps1");
+            if exists {
+                fs::write(&outside, b"# unrelated\n").unwrap();
+            }
+            let target = support_dir.join("shared.ps1");
+            symlink(&outside, &target).unwrap();
+
+            let error = copy_support_hook_scripts(&source, &root.join("hooks/cursor")).unwrap_err();
+
+            assert!(error.to_string().contains("symlink"), "{error:#}");
+            assert_eq!(fs::read_link(&target).unwrap(), outside);
+            if exists {
+                assert_eq!(fs::read(&outside).unwrap(), b"# unrelated\n");
+            } else {
+                assert!(
+                    !outside.exists(),
+                    "staging must not create a symlink target"
+                );
+            }
+            assert_eq!(fs::read_dir(&support_dir).unwrap().count(), 1);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn copy_support_hook_scripts_rejects_symlinked_support_directory() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = TempDir::new().unwrap();
+        let source = readonly_support_bundle(&tmp.path().join("bundle"), b"# managed\n");
+        let dest = tmp.path().join("data/hooks/cursor");
+        fs::create_dir_all(dest.parent().unwrap()).unwrap();
+        let outside = tmp.path().join("outside");
+        fs::create_dir(&outside).unwrap();
+        fs::write(outside.join("shared.ps1"), b"# unrelated\n").unwrap();
+        let target = dest.parent().unwrap().join("lib");
+        symlink(&outside, &target).unwrap();
+
+        let error = copy_support_hook_scripts(&source, &dest).unwrap_err();
+
+        assert!(error.to_string().contains("symlink"), "{error:#}");
+        assert_eq!(fs::read_link(&target).unwrap(), outside);
+        assert_eq!(
+            fs::read(outside.join("shared.ps1")).unwrap(),
+            b"# unrelated\n"
+        );
+        assert_eq!(fs::read_dir(&outside).unwrap().count(), 1);
     }
 
     /// Skipping `_lib.sh` is fine — older source bundles without the

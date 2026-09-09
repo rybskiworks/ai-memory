@@ -23,6 +23,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   entry it added.
 
 ### Fixed
+- Fixed repeated native hook installation from read-only bundles by atomically
+  replacing shared support scripts without inheriting immutable permissions,
+  while refusing symlinked support destinations. (#3)
 - Kept native hook reinstallation and removal consistent for renamed binaries
   by recognizing the exact running executable and hook command signature,
   without matching unrelated executable names or argument paths. (#3)
