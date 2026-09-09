@@ -1248,12 +1248,24 @@ mod slow {
         let bin_dir = tmp.path().join("bin");
         std::fs::create_dir_all(&bin_dir).unwrap();
         let wrapper = bin_dir.join("ai-memory");
-        std::fs::write(&wrapper, read_repo("bin/ai-memory")).unwrap();
+        let mut wrapper_body = read_repo("bin/ai-memory");
+        if !Path::new("/usr/bin/env").is_file() {
+            // Keep the release payload's exact shebang for the checksum and
+            // header checks. Only the scratch wrapper's re-exec needs the Bash
+            // already selected by shell_script_command in a hermetic build.
+            let reexec = "AI_MEMORY_SKIP_SELF_UPGRADE=1 exec \"${script_path}\" upgrade";
+            assert_eq!(wrapper_body.matches(reexec).count(), 1);
+            wrapper_body = wrapper_body.replacen(
+                reexec,
+                "AI_MEMORY_SKIP_SELF_UPGRADE=1 exec \"${BASH}\" \"${script_path}\" upgrade",
+                1,
+            );
+        }
+        std::fs::write(&wrapper, wrapper_body).unwrap();
 
         let payload = tmp.path().join("verified-wrapper");
-        let payload_body =
-            bash_script("#!/usr/bin/env bash\nprintf 'verified wrapper executed\\n'\n");
-        std::fs::write(&payload, &payload_body).unwrap();
+        let payload_body = "#!/usr/bin/env bash\nprintf 'verified wrapper executed\\n'\n";
+        std::fs::write(&payload, payload_body).unwrap();
         let curl = bin_dir.join("curl");
         write_shell_script(
             &curl,
