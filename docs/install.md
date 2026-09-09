@@ -1268,10 +1268,13 @@ ai-memory install-mcp --client prime-agent --apply \
 # (`--agent prime` / `--client prime` are accepted as aliases.)
 ```
 
-Restart prime-agent after installing or changing the extension. The
-refinement lifecycle (`session_before_refine`, `refine_complete`) is captured
-through the extension channel until prime-agent documents a canonical hook
-event for it.
+Restart prime-agent after installing or changing the extension. Prime-agent
+emits `refine_complete` after applying and persisting a refinement; its
+extension API does not expose a pre-refine event. The adapter records that
+completion with the session identity through ai-memory's extension channel
+(`event=other`, `source_event=refine_complete`). It does not capture the
+refinement summary or edits. Prime's local/global refinement scope describes
+its harness settings, not the memory project's scope or authorization.
 
 ### Bind mounts vs docker cp
 

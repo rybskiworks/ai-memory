@@ -23,6 +23,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   entry it added.
 
 ### Fixed
+- Removed the unsupported Prime-agent `session_before_refine` subscription
+  from the generated extension, retaining session-scoped `refine_complete`
+  capture through the extension channel. (#3)
 - OKF-conformed event ledgers are skipped by the indexer again, so a migrated
   store stops growing without bound. The reserved-file check treated any
   `log.md` / `log-YYYY-MM.md` carrying YAML frontmatter as an ordinary page,

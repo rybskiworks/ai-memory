@@ -4151,9 +4151,8 @@ fn resolve_prime_extension_path(args: &InstallHooksArgs) -> Result<PathBuf> {
 /// `tool_result` → `post-tool-use`, `session_shutdown` → `session-end`,
 /// `session_before_compact`/`session_compact` → `pre-compact`.
 ///
-/// prime-agent's refinement lifecycle (`session_before_refine`,
-/// `refine_complete`) has no canonical hook event, so those two ride the
-/// tolerant extension channel
+/// prime-agent's supported `refine_complete` event has no canonical memory
+/// hook event, so it rides the tolerant extension channel
 /// (`?event=other&extension=prime-agent&source_event=<name>`) pending a canonical
 /// enum decision.
 fn build_prime_agent_extension(
@@ -4190,7 +4189,7 @@ fn build_prime_agent_extension(
         )
         .replace(
             "    postHook(\"session-end\", sessionPayload(ctx));\n  });\n}",
-            "    postHook(\"session-end\", sessionPayload(ctx));\n  });\n\n  // Refinement lifecycle has no canonical hook event yet, so it rides the\n  // tolerant extension channel (`?event=other&extension=prime-agent&source_event=...`)\n  // pending a canonical enum decision.\n  pi.on(\"session_before_refine\", (_event: any, ctx: any) => {\n    startSession(ctx);\n    postExtensionHook(\"session_before_refine\", sessionPayload(ctx));\n  });\n\n  pi.on(\"refine_complete\", (_event: any, ctx: any) => {\n    startSession(ctx);\n    postExtensionHook(\"refine_complete\", sessionPayload(ctx));\n  });\n}",
+            "    postHook(\"session-end\", sessionPayload(ctx));\n  });\n\n  // Prime emits refine_complete after applying and persisting a refinement.\n  // There is no pre-refine event in its extension API. Completion rides the\n  // tolerant extension channel until memory has a canonical hook event.\n  pi.on(\"refine_complete\", (_event: any, ctx: any) => {\n    startSession(ctx);\n    postExtensionHook(\"refine_complete\", sessionPayload(ctx));\n  });\n}",
         );
     debug_assert!(!lifecycle.contains(".omp"));
     debug_assert!(!lifecycle.contains("const AGENT = \"pi\";"));
@@ -9207,15 +9206,14 @@ model = "gpt-5"
         assert!(extension.contains("postHook(\"pre-compact\""));
         assert!(extension.contains("postHook(\"stop\""));
         assert!(extension.contains("postHook(\"session-end\""));
-        // Refinement lifecycle rides the tolerant extension channel
+        // Supported refinement completion rides the tolerant extension channel
         // pending a canonical enum decision.
-        assert!(extension.contains("pi.on(\"session_before_refine\""));
+        assert!(!extension.contains("session_before_refine"));
         assert!(extension.contains("pi.on(\"refine_complete\""));
         assert!(extension.contains("function postExtensionHook("));
         assert!(extension.contains("url.searchParams.set(\"event\", \"other\");"));
         assert!(extension.contains("url.searchParams.set(\"extension\", AGENT);"));
         assert!(extension.contains("url.searchParams.set(\"source_event\", sourceEvent);"));
-        assert!(extension.contains("postExtensionHook(\"session_before_refine\""));
         assert!(extension.contains("postExtensionHook(\"refine_complete\""));
         assert!(extension.contains("fetchHandoff"));
         assert!(extension.contains("customType: \"ai-memory-handoff\""));
