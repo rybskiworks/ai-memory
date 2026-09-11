@@ -11857,6 +11857,10 @@ mod tests {
                 serde_json::json!({"isError": true, "output": "PI_SENTINEL"}),
             ),
             (
+                "prime-agent",
+                serde_json::json!({"isError": true, "output": "PRIME_SENTINEL"}),
+            ),
+            (
                 "antigravity-cli",
                 serde_json::json!({"error": "AGY_SENTINEL", "output": "OUTPUT_SENTINEL"}),
             ),
@@ -11881,7 +11885,12 @@ mod tests {
                 env.body_excerpt.as_deref(),
                 Some("tool_family: file\noutcome: unknown")
             );
-            for sentinel in ["PI_SENTINEL", "AGY_SENTINEL", "OUTPUT_SENTINEL"] {
+            for sentinel in [
+                "PI_SENTINEL",
+                "PRIME_SENTINEL",
+                "AGY_SENTINEL",
+                "OUTPUT_SENTINEL",
+            ] {
                 assert!(!env.raw.to_string().contains(sentinel));
                 assert!(!env.body_excerpt.as_deref().unwrap().contains(sentinel));
             }

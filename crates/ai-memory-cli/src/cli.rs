@@ -1398,6 +1398,11 @@ pub enum AgentChoice {
     /// Real Pi coding agent. The generated TypeScript extension provides
     /// lifecycle capture and bridges ai-memory's HTTP MCP tools into Pi.
     Pi,
+    /// PrimeIntellect prime-agent coding agent. The generated TypeScript
+    /// extension provides lifecycle capture and bridges ai-memory's HTTP
+    /// MCP tools into prime-agent.
+    #[value(alias = "prime")]
+    PrimeAgent,
     /// Oh My Pi (`omp`) — TypeScript extension
     /// under `~/.omp/agent/extensions/`. `--apply` writes the extension
     /// file directly; restart `omp` for it to load.
@@ -1485,6 +1490,7 @@ impl AgentChoice {
             Self::GeminiCli => AgentKind::GeminiCli,
             Self::OpenCode | Self::OpenCode2 => AgentKind::OpenCode,
             Self::Pi => AgentKind::Pi,
+            Self::PrimeAgent => AgentKind::PrimeAgent,
             Self::Omp => AgentKind::Omp,
             Self::Openclaw => AgentKind::OpenClaw,
             Self::AntigravityCli => AgentKind::AntigravityCli,
@@ -1510,6 +1516,7 @@ impl AgentChoice {
             Self::OpenCode
             | Self::OpenCode2
             | Self::Pi
+            | Self::PrimeAgent
             | Self::Omp
             | Self::Openclaw
             | Self::Zero
@@ -1616,6 +1623,13 @@ pub enum McpClient {
     /// Real Pi coding agent. Uses ai-memory's generated bridge extension
     /// because Pi has no native MCP config.
     Pi,
+    /// PrimeIntellect prime-agent. Merges an HTTP entry with a read-only
+    /// `enabledTools` subset into the `mcpServers` map of the user-global
+    /// `~/.prime/agent/settings.json` (`$PRIME_AGENT_CODING_AGENT_DIR`
+    /// honored); pair with `install-hooks --agent prime-agent` for lifecycle
+    /// capture through the generated extension.
+    #[value(alias = "prime")]
+    PrimeAgent,
     /// Oh My Pi (`omp`) — `~/.omp/agent/mcp.json`.
     #[value(alias = "oh-my-pi")]
     Omp,
@@ -2749,6 +2763,43 @@ mod tests {
                 matches!(args.agent, AgentChoice::Pi) == expected_pi,
                 "alias {alias} resolved to unexpected hook agent: {:?}",
                 args.agent
+            );
+        }
+    }
+
+    #[test]
+    fn prime_agent_hook_and_mcp_aliases_parse_to_prime_agent_variant() {
+        for alias in ["prime", "prime-agent"] {
+            let mcp_cli = Cli::try_parse_from([
+                "ai-memory",
+                "install-mcp",
+                "--client",
+                alias,
+                "--server-url",
+                "http://example.test:49374/mcp",
+            ])
+            .unwrap_or_else(|e| panic!("failed to parse install-mcp alias {alias}: {e}"));
+            let Command::InstallMcp(mcp_args) = mcp_cli.command else {
+                panic!("expected install-mcp command for alias {alias}");
+            };
+            assert!(matches!(mcp_args.client, McpClient::PrimeAgent));
+
+            let hook_cli = Cli::try_parse_from([
+                "ai-memory",
+                "install-hooks",
+                "--agent",
+                alias,
+                "--server-url",
+                "http://example.test:49374",
+            ])
+            .unwrap_or_else(|e| panic!("failed to parse install-hooks alias {alias}: {e}"));
+            let Command::InstallHooks(hook_args) = hook_cli.command else {
+                panic!("expected install-hooks command for alias {alias}");
+            };
+            assert!(matches!(hook_args.agent, AgentChoice::PrimeAgent));
+            assert_eq!(
+                hook_args.agent.kind(),
+                ai_memory_core::AgentKind::PrimeAgent
             );
         }
     }

@@ -176,6 +176,10 @@ pub(crate) fn tool_observation_metadata(
             object.get("tool")?.as_str()?,
             object.get("callID").and_then(Value::as_str),
         ),
+        AgentKind::PrimeAgent => (
+            object.get("tool")?.as_str()?,
+            object.get("callID").and_then(Value::as_str),
+        ),
         // Kiro v2/v3 tool hooks use `tool_name` + `tool_input`. Unknown payload
         // shapes fail safe to metadata-only under an active policy.
         AgentKind::KiroCli => (object.get("tool_name")?.as_str()?, None),
@@ -227,11 +231,13 @@ pub(crate) fn tool_observation_metadata(
 /// Extracts an outcome only where the adapter protocol proves its meaning.
 pub(crate) fn tool_observation_outcome(agent: AgentKind, raw: &Value) -> ToolOutcome {
     match agent {
-        AgentKind::Pi => match raw.get("isError").and_then(Value::as_bool) {
-            Some(true) => ToolOutcome::Error,
-            Some(false) => ToolOutcome::Success,
-            None => ToolOutcome::Unknown,
-        },
+        AgentKind::Pi | AgentKind::PrimeAgent => {
+            match raw.get("isError").and_then(Value::as_bool) {
+                Some(true) => ToolOutcome::Error,
+                Some(false) => ToolOutcome::Success,
+                None => ToolOutcome::Unknown,
+            }
+        }
         AgentKind::KiroCli => match raw
             .get("tool_response")
             .and_then(|response| response.get("success"))
@@ -604,7 +610,7 @@ fn extract(agent: AgentKind, raw: &Value) -> Extracted {
             .get("tool_name")
             .and_then(Value::as_str)
             .map(|name| (name, object.get("tool_input"))),
-        AgentKind::OpenCode | AgentKind::Omp | AgentKind::Pi | AgentKind::OpenClaw => object
+        AgentKind::OpenCode | AgentKind::Omp | AgentKind::Pi | AgentKind::PrimeAgent | AgentKind::OpenClaw => object
             .get("tool")
             .and_then(Value::as_str)
             .map(|name| (name, object.get("args"))),

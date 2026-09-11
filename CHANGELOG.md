@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- Added locked native Nix packaging with a shared Rust toolchain, core-library
+  tests, and an isolated provider-free HTTP/MCP package check. (#2)
+- Prime-agent lifecycle capture and MCP tools via a generated TypeScript
+  extension. `install-hooks --agent prime-agent --apply` (alias `prime`)
+  writes `~/.prime/agent/extensions/ai-memory-prime-agent.ts` (or
+  `$PRIME_AGENT_CODING_AGENT_DIR/extensions/` when set), which posts
+  lifecycle events to `/hook`, fetches pending handoffs in
+  `before_agent_start`, and registers ai-memory's HTTP MCP tools through
+  `pi.registerTool`; `install-mcp --client prime-agent` (alias `prime`) merges a native HTTP entry
+  with a read-only `enabledTools` subset into the `mcpServers` map of the
+  user-global prime-agent `settings.json` (preserving unrelated keys and
+  sibling servers), and `uninstall` removes only the generated file and the
+  entry it added.
+
 ### Changed
 - The managed routing snippet now states that Claude Code loads `CLAUDE.md` and
   does not read `AGENTS.md`: a project whose canonical instruction file is
@@ -17,6 +32,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   now uses the import instead of a prose pointer (#680).
 
 ### Fixed
+- Fixed repeated native hook installation from read-only bundles by atomically
+  replacing shared support scripts without inheriting immutable permissions,
+  while refusing symlinked support destinations. (#3)
+- Kept native hook reinstallation and removal consistent for renamed binaries
+  by recognizing the exact running executable and hook command signature,
+  without matching unrelated executable names or argument paths. (#3)
+- Removed the unsupported Prime-agent `session_before_refine` subscription
+  from the generated extension, retaining session-scoped `refine_complete`
+  capture through the extension channel alongside the shared asynchronous,
+  bounded session-end drain. (#3)
 - The from-source AUR `PKGBUILD` now builds and tests on constrained AUR
   builders. Release LTO was disabled (`options=('!debug' '!lto')`) so the
   final link no longer gets OOM-killed on low-memory build hosts, and the

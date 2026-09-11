@@ -9,7 +9,7 @@
 #   ai-memory-install-hooks --agent claude-code
 #
 # Options:
-#   --agent <claude-code|codex|command-code|cursor|gemini-cli|kimi-code|kiro-cli|antigravity-cli|grok|opencode|opencode2|openclaw|omp|oh-my-pi|pi>
+#   --agent <claude-code|codex|command-code|cursor|gemini-cli|kimi-code|kiro-cli|antigravity-cli|grok|opencode|opencode2|openclaw|omp|oh-my-pi|pi|prime|prime-agent>
 #                                                which agent (default: claude-code;
 #                                                generated-plugin agents print hints)
 #   --to <dir>                               install root (default: $HOME/.ai-memory/hooks)
@@ -46,12 +46,13 @@ while [[ $# -gt 0 ]]; do
 done
 
 case "$AGENT" in
-    claude-code|codex|command-code|cursor|gemini-cli|kimi-code|kiro-cli|antigravity-cli|grok|opencode|opencode2|openclaw|omp|pi|oh-my-pi) ;;
+    claude-code|codex|command-code|cursor|gemini-cli|kimi-code|kiro-cli|antigravity-cli|grok|opencode|opencode2|openclaw|omp|pi|oh-my-pi|prime-agent) ;;
     commandcode|cmdc|cmd) AGENT="command-code" ;;
     kiro) AGENT="kiro-cli" ;;
     opencode-v2|open-code2) AGENT="opencode2" ;;
+    prime) AGENT="prime-agent" ;;
     *)
-        echo "unsupported agent: $AGENT (expected claude-code | codex | command-code | cursor | gemini-cli | kimi-code | kiro-cli | antigravity-cli | grok | opencode | opencode2 | openclaw | omp | pi | oh-my-pi)" >&2
+        echo "unsupported agent: $AGENT (expected claude-code | codex | command-code | cursor | gemini-cli | kimi-code | kiro-cli | antigravity-cli | grok | opencode | opencode2 | openclaw | omp | pi | oh-my-pi | prime | prime-agent)" >&2
         exit 64 ;;
 esac
 
@@ -97,6 +98,15 @@ if [[ "$AGENT" == "pi" ]]; then
     echo "Run: ai-memory install-hooks --agent pi --apply"
     echo "Then restart Pi so it loads ~/.pi/agent/extensions/ai-memory.ts."
     echo "MCP tools come through the same generated bridge extension."
+    exit 0
+fi
+
+if [[ "$AGENT" == "prime-agent" ]]; then
+    echo "prime-agent uses a generated TypeScript extension, not shell hook scripts."
+    echo "Run: ai-memory install-hooks --agent prime-agent --apply"
+    echo "Then restart prime-agent so it loads ~/.prime/agent/extensions/ai-memory-prime-agent.ts."
+    echo "MCP tools come through the same generated bridge extension."
+    echo "For on-demand reads also run: ai-memory install-mcp --client prime-agent --apply"
     exit 0
 fi
 

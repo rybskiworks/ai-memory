@@ -99,6 +99,7 @@ caveats is in [`docs/support-matrix.md`](docs/support-matrix.md).
 | Gemini CLI | Supported |
 | Oh My Pi / OMP | Supported |
 | Pi | Supported |
+| Prime-agent | Supported |
 | Crush | Managed-only |
 | Managed workstreams | Opt-in |
 | Claude Desktop | MCP-only |

@@ -9,7 +9,7 @@ path (docker + Claude Code). This page covers everything else:
 - [Arch Linux native packages (AUR)](#arch-linux-native-packages-aur)
   (systemd system service or user service)
 - [Configuring other agent CLIs](#configuring-other-agent-clis)
-  (Codex, Command Code, Devin CLI, OpenCode, OMP, Pi, Cursor, Claude Desktop, Gemini CLI, Antigravity CLI, Grok Build CLI, Zero, ZCode, Kimi Code, Kiro CLI, Pool, OpenClaw, VS Code Copilot, Zed)
+  (Codex, Command Code, Devin CLI, OpenCode, OMP, Pi, Prime-agent, Cursor, Claude Desktop, Gemini CLI, Antigravity CLI, Grok Build CLI, Zero, ZCode, Kimi Code, Kiro CLI, Pool, OpenClaw, VS Code Copilot, Zed)
 - [Installing hooks without docker](#installing-hooks-without-docker)
   (curl-based installer)
 - [Running ai-memory without docker](#running-ai-memory-without-docker)
@@ -451,7 +451,7 @@ a script fallback.
 ### Capture-policy capability and refresh
 
 `[capture] ignore_paths` is enforced only by native `ai-memory hook` commands
-and generated OpenCode/OMP/Pi/OpenClaw integrations. Local installers select
+and generated OpenCode/OMP/Pi/Prime-agent/OpenClaw integrations. Local installers select
 native commands where supported; legacy `.sh`/`.ps1` hooks and remote-only or
 Docker script bundles do not enforce it. Re-run `install-hooks --agent <agent>
 --apply` or refresh/reinstall generated plugins after upgrading; installer
@@ -721,7 +721,7 @@ including Pi and Zero, have lifecycle capture paths through `install-hooks`.
 > enforce capture-policy v1. Remote-only/Docker script installs still use the
 > two-step path: (1) `docker cp` bundled scripts to your home dir, (2)
 > `docker run --rm install-hooks` renders the config snippet.
-> OpenClaw, OpenCode, OMP, and Pi are different: they use generated
+> OpenClaw, OpenCode, OMP, Pi, and Prime-agent are different: they use generated
 > TypeScript plugin/extension files, so no shell-script extraction is
 > needed for those clients.
 
@@ -1246,6 +1246,47 @@ ai-memory install-mcp --client pi --server-url "http://homelab:49374/mcp"
 Restart Pi after installing or changing the extension. OMP / Oh My Pi remains
 separate and continues to use `.omp` paths.
 
+### Prime-agent
+
+Prime-agent gets both halves: lifecycle capture through one generated
+TypeScript extension at `~/.prime/agent/extensions/ai-memory-prime-agent.ts`, and
+model-invoked reads through a native `mcpServers` entry in the user-global
+`~/.prime/agent/settings.json`. The extension captures lifecycle events and
+bridges ai-memory's HTTP MCP tools into prime-agent with `pi.registerTool`;
+the settings entry exposes a read-only `enabledTools` subset
+(`memory_query`, `memory_read_page`) so the model can pull context on demand
+while writes stay lifecycle-automatic. When
+`PRIME_AGENT_CODING_AGENT_DIR` is set (it relocates prime-agent's whole
+`~/.prime/agent` home), both the extension and the settings file resolve
+under it instead. prime-agent uses its own config directory, so it never
+shares an extensions directory with Pi or OMP.
+
+```bash
+ai-memory install-hooks --agent prime-agent --apply \
+    --server-url "http://homelab:49374" \
+    --auth-token "$TOKEN"
+
+ai-memory install-mcp --client prime-agent --apply \
+    --server-url "http://homelab:49374/mcp" \
+    --auth-token "$TOKEN"
+# With --auth-token the entry names AI_MEMORY_AUTH_TOKEN rather than
+# embedding the token: export it in your shell init.
+# (`--agent prime` / `--client prime` are accepted as aliases.)
+```
+
+Restart prime-agent after installing or changing the extension. Prime-agent
+emits `refine_complete` after applying and persisting a refinement; its
+extension API does not expose a pre-refine event. The adapter records that
+completion with the session identity through ai-memory's extension channel
+(`event=other`, `source_event=refine_complete`). It does not capture the
+refinement summary or edits. Prime's local/global refinement scope describes
+its harness settings, not the memory project's scope or authorization.
+
+The asynchronous `session_shutdown` handler posts `session-end` and awaits the
+shared hook queue for up to two seconds before returning. This bounded drain
+coexists with refinement capture; it is best-effort delivery, not a guarantee
+that every queued observation has committed before the harness exits.
+
 ### Bind mounts vs docker cp
 
 The `setup-agent` subcommand does the extract + render in one shot
@@ -1488,6 +1529,58 @@ local-data directory on Windows, typically
 `%LOCALAPPDATA%\ai-memory`. Override with `AI_MEMORY_DATA_DIR=/path`.
 To require bearer-token auth, set `AI_MEMORY_AUTH_TOKEN` in the
 server's environment.
+
+### Nix source builds and development
+
+The fork's flake builds the native binary from the checked-out source and
+`Cargo.lock`; it does not wrap or download a Docker release. `flake.lock`
+pins the shared `nix-tooling` input, which owns the Nixpkgs and Fenix
+revisions. Nix builds, the development shell, and the Rust formatting check
+use Rust **1.97.1**. The unchanged `rust-toolchain.toml` and Cargo MSRV remain
+the **1.95** contract for non-Nix development and upstream compatibility;
+passing the Nix checks is not evidence of a Rust 1.95 build.
+
+From the repository root:
+
+```bash
+nix flake check --no-build --no-update-lock-file
+nix build --no-update-lock-file
+nix run --no-update-lock-file . -- --version
+nix build --no-update-lock-file .#checks.x86_64-linux.native-service
+nix build --no-update-lock-file .#checks.x86_64-linux.rustfmt
+nix develop --no-update-lock-file -c cargo --version
+```
+
+The default package includes `cargo test --package ai-memory-core --lib`.
+The `native-service` check runs the installed binary in fresh temporary
+HOME, XDG and data directories, with an ephemeral bearer token and a
+loopback-only listener. It checks version and bundled assets, HTTP bearer
+and Host rejection, disabled provider health, MCP initialization/tool
+listing, and a scoped write followed by FTS retrieval. It stops and reaps
+only its own server before removing the temporary state. No installed
+client, provider credentials, model, existing database or Docker daemon is
+used. Run with Nix sandboxing enabled to deny external network access.
+
+These are bounded native packaging checks, **not** the full workspace,
+Docker-wrapper, companion, cross-platform or live-provider acceptance
+suite. Before upstream handoff, also run the contributor guide's formatter,
+Clippy, full workspace tests and dependency-policy gates; run companion
+tests with their separate manifest. Outputs remain available for Linux and
+macOS on x86-64 and ARM64; each platform needs its own build verification.
+
+Nix builds use the committed Tailwind stylesheet (`TAILWIND_BUILD=0`).
+Stylesheet regeneration and freshness validation remain the existing
+explicit maintenance workflow. Runtime local embeddings are a different
+concern: their default can fetch a model even without an API key. For an
+offline server, put `embedding_provider = "none"` at the **root** of its
+configuration, keep LLM providers unset, and disable scheduled maintenance
+when appropriate. The package check supplies these settings explicitly;
+it does not change normal service defaults or install a service.
+
+Update shared tool revisions deliberately in `flake.nix`, regenerate
+`flake.lock` with `nix flake lock`, and review/build the resulting package
+and checks before publishing the new pin. Ordinary build and development
+commands above refuse implicit lock updates.
 
 #### Optional serve flags
 
@@ -2297,6 +2390,22 @@ image, re-stages hook scripts under
 prints how to restart the server container so the new binary is used.
 Re-running `install-hooks --apply` remains idempotent: ai-memory
 replaces only the hook entries it owns and leaves unrelated hooks alone.
+Native command-string hooks also recognize a renamed binary when installation,
+reinstallation and removal use the same executable path. Recognition requires
+that exact generated executable prefix and the native hook flags; an unrelated
+command mentioning the path in an argument is not adopted. If a renamed binary
+is moved, review its old hook entries rather than assuming another executable
+path can identify them automatically.
+
+Shared PowerShell support scripts staged by `install-hooks` are replaced
+atomically without inheriting a read-only bundle's permissions, so native
+installation can be repeated against an immutable Nix package. Identical
+support files are left untouched. Symlinks at the managed support file or
+its `lib/` directory are refused without modifying their targets; this does
+not change support for symlinked agent configuration files. On Windows, a
+changed legacy destination explicitly marked read-only can still be refused
+by the filesystem; installation does not clear that attribute automatically.
+
 When a Compose file is found, the wrapper first verifies that its project owns
 the running `ai-memory` container. A standalone container is never handed to an
 unrelated Compose project just because its file occupies a conventional path;
