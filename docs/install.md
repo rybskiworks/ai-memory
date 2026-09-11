@@ -124,6 +124,12 @@ legacy long snippets between `<!-- ai-memory:start -->` /
 `<!-- ai-memory:end -->` are replaced in place with the slim snippet, and
 managed Agent Skills are installed or updated alongside it.
 
+If you install into `AGENTS.md` and the project is also used from Claude Code,
+make `CLAUDE.md` import it with a bare `@AGENTS.md` first line. Claude Code
+loads `CLAUDE.md` and does not read `AGENTS.md`, so without that import the
+installed block is absent from context at session start. See
+[Claude Code memory](https://code.claude.com/docs/en/memory#agents-md).
+
 ---
 
 ## Configuring the CLI URL and auth
@@ -1268,10 +1274,18 @@ ai-memory install-mcp --client prime-agent --apply \
 # (`--agent prime` / `--client prime` are accepted as aliases.)
 ```
 
-Restart prime-agent after installing or changing the extension. The
-refinement lifecycle (`session_before_refine`, `refine_complete`) is captured
-through the extension channel until prime-agent documents a canonical hook
-event for it.
+Restart prime-agent after installing or changing the extension. Prime-agent
+emits `refine_complete` after applying and persisting a refinement; its
+extension API does not expose a pre-refine event. The adapter records that
+completion with the session identity through ai-memory's extension channel
+(`event=other`, `source_event=refine_complete`). It does not capture the
+refinement summary or edits. Prime's local/global refinement scope describes
+its harness settings, not the memory project's scope or authorization.
+
+The asynchronous `session_shutdown` handler posts `session-end` and awaits the
+shared hook queue for up to two seconds before returning. This bounded drain
+coexists with refinement capture; it is best-effort delivery, not a guarantee
+that every queued observation has committed before the harness exits.
 
 ### Bind mounts vs docker cp
 
@@ -1515,6 +1529,58 @@ local-data directory on Windows, typically
 `%LOCALAPPDATA%\ai-memory`. Override with `AI_MEMORY_DATA_DIR=/path`.
 To require bearer-token auth, set `AI_MEMORY_AUTH_TOKEN` in the
 server's environment.
+
+### Nix source builds and development
+
+The fork's flake builds the native binary from the checked-out source and
+`Cargo.lock`; it does not wrap or download a Docker release. `flake.lock`
+pins the shared `nix-tooling` input, which owns the Nixpkgs and Fenix
+revisions. Nix builds, the development shell, and the Rust formatting check
+use Rust **1.97.1**. The unchanged `rust-toolchain.toml` and Cargo MSRV remain
+the **1.95** contract for non-Nix development and upstream compatibility;
+passing the Nix checks is not evidence of a Rust 1.95 build.
+
+From the repository root:
+
+```bash
+nix flake check --no-build --no-update-lock-file
+nix build --no-update-lock-file
+nix run --no-update-lock-file . -- --version
+nix build --no-update-lock-file .#checks.x86_64-linux.native-service
+nix build --no-update-lock-file .#checks.x86_64-linux.rustfmt
+nix develop --no-update-lock-file -c cargo --version
+```
+
+The default package includes `cargo test --package ai-memory-core --lib`.
+The `native-service` check runs the installed binary in fresh temporary
+HOME, XDG and data directories, with an ephemeral bearer token and a
+loopback-only listener. It checks version and bundled assets, HTTP bearer
+and Host rejection, disabled provider health, MCP initialization/tool
+listing, and a scoped write followed by FTS retrieval. It stops and reaps
+only its own server before removing the temporary state. No installed
+client, provider credentials, model, existing database or Docker daemon is
+used. Run with Nix sandboxing enabled to deny external network access.
+
+These are bounded native packaging checks, **not** the full workspace,
+Docker-wrapper, companion, cross-platform or live-provider acceptance
+suite. Before upstream handoff, also run the contributor guide's formatter,
+Clippy, full workspace tests and dependency-policy gates; run companion
+tests with their separate manifest. Outputs remain available for Linux and
+macOS on x86-64 and ARM64; each platform needs its own build verification.
+
+Nix builds use the committed Tailwind stylesheet (`TAILWIND_BUILD=0`).
+Stylesheet regeneration and freshness validation remain the existing
+explicit maintenance workflow. Runtime local embeddings are a different
+concern: their default can fetch a model even without an API key. For an
+offline server, put `embedding_provider = "none"` at the **root** of its
+configuration, keep LLM providers unset, and disable scheduled maintenance
+when appropriate. The package check supplies these settings explicitly;
+it does not change normal service defaults or install a service.
+
+Update shared tool revisions deliberately in `flake.nix`, regenerate
+`flake.lock` with `nix flake lock`, and review/build the resulting package
+and checks before publishing the new pin. Ordinary build and development
+commands above refuse implicit lock updates.
 
 #### Optional serve flags
 
@@ -2324,6 +2390,22 @@ image, re-stages hook scripts under
 prints how to restart the server container so the new binary is used.
 Re-running `install-hooks --apply` remains idempotent: ai-memory
 replaces only the hook entries it owns and leaves unrelated hooks alone.
+Native command-string hooks also recognize a renamed binary when installation,
+reinstallation and removal use the same executable path. Recognition requires
+that exact generated executable prefix and the native hook flags; an unrelated
+command mentioning the path in an argument is not adopted. If a renamed binary
+is moved, review its old hook entries rather than assuming another executable
+path can identify them automatically.
+
+Shared PowerShell support scripts staged by `install-hooks` are replaced
+atomically without inheriting a read-only bundle's permissions, so native
+installation can be repeated against an immutable Nix package. Identical
+support files are left untouched. Symlinks at the managed support file or
+its `lib/` directory are refused without modifying their targets; this does
+not change support for symlinked agent configuration files. On Windows, a
+changed legacy destination explicitly marked read-only can still be refused
+by the filesystem; installation does not clear that attribute automatically.
+
 When a Compose file is found, the wrapper first verifies that its project owns
 the running `ai-memory` container. A standalone container is never handed to an
 unrelated Compose project just because its file occupies a conventional path;

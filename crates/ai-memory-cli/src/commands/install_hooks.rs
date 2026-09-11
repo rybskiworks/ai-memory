@@ -3139,6 +3139,60 @@ const AiMemoryOpencode2: Plugin = {
 
 export default AiMemoryOpencode2;
 "#;
+/// `findSettingsMarker` mirrors the native `find_settings_marker` (`marker.rs`)
+/// and the shell `ai_memory_find_settings_marker` (`hooks/_lib.sh`), #668:
+/// the same ancestor walk and HOME/`.git` boundary as `findMarker`, but a
+/// marker that declares nothing beyond `[capture]` is transparent — the walk
+/// skips it and continues to the next ancestor. That keeps a nested
+/// capture-only marker (e.g. one that only sets `ignore_paths`) from
+/// shadowing an outer marker's `workspace`/`project`/etc, without changing
+/// `[capture]`/`ignore_paths` resolution itself (that stays on `findMarker`,
+/// the nearest marker, in the separate capture-policy template). The
+/// boundary walk is duplicated from `findMarker` rather than shared, on
+/// purpose: `findMarker` stays untouched, well-exercised, nearest-marker
+/// behavior for every other caller.
+pub(crate) const TS_FIND_SETTINGS_MARKER: &str = r#"function declaresSettings(text: string): boolean {
+  for (const key of ["workspace", "project", "project_strategy", "drop_subagent_captures"]) {
+    if (tomlKey(text, key) !== undefined) return true;
+  }
+  for (const key of ["default_global", "inject_on_session_start", "max_chars"]) {
+    if (tomlFlag(text, key) !== undefined) return true;
+  }
+  return false;
+}
+
+function findSettingsMarker(cwd: string | undefined): string | undefined {
+  if (!cwd) return undefined;
+  let dir = resolve(cwd);
+  const home = homedir();
+  let boundary: string | undefined;
+  if (home && (dir === home || dir.startsWith(home.endsWith(sep) ? home : home + sep))) {
+    boundary = home;
+  } else if (home) {
+    let probe = dir;
+    while (probe && probe !== dirname(probe)) {
+      if (existsSync(join(probe, ".git"))) {
+        boundary = probe;
+        break;
+      }
+      probe = dirname(probe);
+    }
+    boundary ??= dir;
+  }
+  while (dir && dir !== dirname(dir)) {
+    const marker = join(dir, ".ai-memory.toml");
+    if (existsSync(marker)) {
+      try {
+        if (declaresSettings(readFileSync(marker, "utf8"))) return marker;
+      } catch (_e) {
+      }
+    }
+    if (boundary && dir === boundary) return undefined;
+    dir = dirname(dir);
+  }
+  return undefined;
+}"#;
+
 /// Emit the `applyMarkerParams` TypeScript function shared verbatim by the
 /// OpenCode plugin and the OMP extension.
 ///
@@ -3148,14 +3202,18 @@ export default AiMemoryOpencode2;
 /// that install-time default when no marker pins a `project_strategy` (#128).
 /// A marker's own `project` / `project_strategy` still take precedence (§3.3),
 /// and repo-root is resolved host-side via `repoRootProject`.
+///
+/// Scope/settings resolution walks past a capture-only marker to the nearest
+/// ancestor marker that declares a setting (#668) via `findSettingsMarker`,
+/// emitted alongside this function.
 fn ts_apply_marker_params(default_strategy: Option<&str>) -> String {
     let Some(default) = default_strategy else {
         return format!(
-            "{TS_TOML_FLAG}\n{}",
+            "{TS_TOML_FLAG}\n{TS_FIND_SETTINGS_MARKER}\n{}",
             r#"function applyMarkerParams(url: URL, cwd: string | undefined): void {
   const managedRun = process.env.AI_MEMORY_RUN_ID;
   if (managedRun) url.searchParams.set("managed_run", managedRun);
-  const marker = findMarker(cwd);
+  const marker = findSettingsMarker(cwd);
   if (!marker || !cwd) return;
   url.searchParams.set("cwd", cwd);
   try {
@@ -3195,7 +3253,7 @@ fn ts_apply_marker_params(default_strategy: Option<&str>) -> String {
   let defaultGlobal: string | undefined;
   let briefing: string | undefined;
   let briefingBudget: string | undefined;
-  const marker = findMarker(cwd);
+  const marker = findSettingsMarker(cwd);
   if (marker) {
     try {
       const body = readFileSync(marker, "utf8");
@@ -3223,7 +3281,7 @@ fn ts_apply_marker_params(default_strategy: Option<&str>) -> String {
   if (briefingBudget) url.searchParams.set("briefing_budget", briefingBudget);
 }"#;
     format!(
-        "const DEFAULT_PROJECT_STRATEGY = {};\n{TS_TOML_FLAG}\n{body}",
+        "const DEFAULT_PROJECT_STRATEGY = {};\n{TS_TOML_FLAG}\n{TS_FIND_SETTINGS_MARKER}\n{body}",
         ts_string_literal(default)
     )
 }
@@ -4151,9 +4209,8 @@ fn resolve_prime_extension_path(args: &InstallHooksArgs) -> Result<PathBuf> {
 /// `tool_result` → `post-tool-use`, `session_shutdown` → `session-end`,
 /// `session_before_compact`/`session_compact` → `pre-compact`.
 ///
-/// prime-agent's refinement lifecycle (`session_before_refine`,
-/// `refine_complete`) has no canonical hook event, so those two ride the
-/// tolerant extension channel
+/// prime-agent's supported `refine_complete` event has no canonical memory
+/// hook event, so it rides the tolerant extension channel
 /// (`?event=other&extension=prime-agent&source_event=<name>`) pending a canonical
 /// enum decision.
 fn build_prime_agent_extension(
@@ -4162,7 +4219,13 @@ fn build_prime_agent_extension(
     project_strategy: Option<&str>,
     capture_mode: &str,
 ) -> String {
-    let lifecycle = build_omp_extension(server_url, auth_token, project_strategy, capture_mode)
+    let lifecycle = build_omp_extension_with_extra_handlers(
+        server_url,
+        auth_token,
+        project_strategy,
+        capture_mode,
+        PRIME_REFINEMENT_HANDLER,
+    )
         .replace(
             "install-hooks --agent omp --apply",
             "install-hooks --agent prime-agent --apply",
@@ -4187,16 +4250,22 @@ fn build_prime_agent_extension(
         .replace(
             "async function fetchHandoff(",
             &format!("{PRIME_EXTENSION_HOOK_SOURCE}\n\nasync function fetchHandoff("),
-        )
-        .replace(
-            "    postHook(\"session-end\", sessionPayload(ctx));\n  });\n}",
-            "    postHook(\"session-end\", sessionPayload(ctx));\n  });\n\n  // Refinement lifecycle has no canonical hook event yet, so it rides the\n  // tolerant extension channel (`?event=other&extension=prime-agent&source_event=...`)\n  // pending a canonical enum decision.\n  pi.on(\"session_before_refine\", (_event: any, ctx: any) => {\n    startSession(ctx);\n    postExtensionHook(\"session_before_refine\", sessionPayload(ctx));\n  });\n\n  pi.on(\"refine_complete\", (_event: any, ctx: any) => {\n    startSession(ctx);\n    postExtensionHook(\"refine_complete\", sessionPayload(ctx));\n  });\n}",
         );
     debug_assert!(!lifecycle.contains(".omp"));
     debug_assert!(!lifecycle.contains("const AGENT = \"pi\";"));
     debug_assert!(!lifecycle.contains("ai-memory-pi-"));
     lifecycle
 }
+
+const PRIME_REFINEMENT_HANDLER: &str = r#"
+
+  // Prime emits refine_complete after applying and persisting a refinement.
+  // There is no pre-refine event in its extension API. Completion rides the
+  // tolerant extension channel until memory has a canonical hook event.
+  api.on("refine_complete", (_event: any, ctx: any) => {
+    startSession(ctx);
+    postExtensionHook("refine_complete", sessionPayload(ctx));
+  });"#;
 
 /// `postExtensionHook`: the tolerant extension channel for prime-agent
 /// events with no canonical hook-event name (currently the refinement
@@ -4310,6 +4379,24 @@ fn build_omp_extension(
     project_strategy: Option<&str>,
     capture_mode: &str,
 ) -> String {
+    build_omp_extension_with_extra_handlers(
+        server_url,
+        auth_token,
+        project_strategy,
+        capture_mode,
+        "",
+    )
+}
+
+// Adapter-specific registrations have an explicit slot in the shared factory,
+// independent of changes to the shutdown handler or its bounded queue drain.
+fn build_omp_extension_with_extra_handlers(
+    server_url: &str,
+    auth_token: Option<&str>,
+    project_strategy: Option<&str>,
+    capture_mode: &str,
+    extra_handlers: &str,
+) -> String {
     let token_line = auth_token
         .map(|t| format!("const TOKEN: string | null = {};\n", ts_string_literal(t)))
         .unwrap_or_else(|| "const TOKEN: string | null = null;\n".to_string());
@@ -4347,12 +4434,14 @@ const HOOK_FLUSH_INTERVAL_MS = 2000;
 const HOOK_FLUSH_THRESHOLD = 20;
 const HOOK_INTER_REQUEST_DELAY_MS = 50;
 const HOOK_REQUEST_TIMEOUT_MS = 2000;
+const HOOK_DISPOSE_DRAIN_BUDGET_MS = 2000;
 const HOOK_IMMEDIATE_EVENTS = new Set(["session-start", "stop", "session-end", "pre-compact"]);
 
 type HookQueueItem = {{ event: string; url: URL; payload: Record<string, unknown> }};
 const hookQueue: HookQueueItem[] = [];
 let hookFlushTimer: ReturnType<typeof setTimeout> | undefined;
 let hookDraining = false;
+let hookDrainPromise: Promise<void> | undefined;
 
 function sleep(ms: number): Promise<void> {{
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -4362,16 +4451,37 @@ function scheduleHookFlush(): void {{
   if (hookFlushTimer) return;
   hookFlushTimer = setTimeout(() => {{
     hookFlushTimer = undefined;
-    void drainHookQueue();
+    void requestHookDrain();
   }}, HOOK_FLUSH_INTERVAL_MS);
   hookFlushTimer.unref?.();
+}}
+
+function requestHookDrain(): Promise<void> {{
+  if (!hookDrainPromise) {{
+    hookDrainPromise = drainHookQueue().finally(() => {{
+      hookDrainPromise = undefined;
+      if (hookQueue.length > 0) void requestHookDrain();
+    }});
+  }}
+  return hookDrainPromise;
+}}
+
+function disposeDrainTimeout(): Promise<void> {{
+  return new Promise((resolve) => {{
+    const timer = setTimeout(resolve, HOOK_DISPOSE_DRAIN_BUDGET_MS);
+    timer.unref?.();
+  }});
+}}
+
+async function drainHookQueueForDispose(): Promise<void> {{
+  await Promise.race([requestHookDrain(), disposeDrainTimeout()]);
 }}
 
 function enqueueHook(event: string, url: URL, payload: Record<string, unknown>): void {{
   if (hookQueue.length >= HOOK_QUEUE_MAX) hookQueue.shift();
   hookQueue.push({{ event, url, payload }});
   if (HOOK_IMMEDIATE_EVENTS.has(event) || hookQueue.length >= HOOK_FLUSH_THRESHOLD) {{
-    void drainHookQueue();
+    void requestHookDrain();
   }} else {{
     scheduleHookFlush();
   }}
@@ -4402,7 +4512,6 @@ async function drainHookQueue(): Promise<void> {{
     }}
   }} finally {{
     hookDraining = false;
-    if (hookQueue.length > 0) void drainHookQueue();
   }}
 }}
 
@@ -4635,10 +4744,11 @@ export default function AiMemoryExtension(api: any): void {{
     postHook("stop", sessionPayload(ctx));
   }});
 
-  api.on("session_shutdown", (_event: any, ctx: any) => {{
+  api.on("session_shutdown", async (_event: any, ctx: any) => {{
     startSession(ctx);
     postHook("session-end", sessionPayload(ctx));
-  }});
+    await drainHookQueueForDispose();
+  }});{extra_handlers}
 }}
 "#,
         server_literal = ts_string_literal(server_url),
@@ -4911,6 +5021,12 @@ fn copy_support_hook_scripts(source_dir: &Path, dest_root: &Path) -> Result<()> 
         return Ok(());
     };
     let dest_lib = dest_hooks_root.join("lib");
+    if dest_lib.is_symlink() {
+        anyhow::bail!(
+            "refusing to stage hook support scripts through symlink {}",
+            dest_lib.display()
+        );
+    }
     fs::create_dir_all(&dest_lib)
         .with_context(|| format!("creating hook support dir {}", dest_lib.display()))?;
     for entry in fs::read_dir(&source_lib)
@@ -4922,8 +5038,26 @@ fn copy_support_hook_scripts(source_dir: &Path, dest_root: &Path) -> Result<()> 
             continue;
         }
         let to = dest_lib.join(from.file_name().context("bad support file name")?);
-        fs::copy(&from, &to)
-            .with_context(|| format!("copying {} → {}", from.display(), to.display()))?;
+        // These are managed bundle assets, not user configuration symlinks.
+        // Never follow a destination link or copy immutable source permissions
+        // onto the staged file: a later install must be able to replace it.
+        if to.is_symlink() {
+            anyhow::bail!(
+                "refusing to stage hook support script through symlink {}",
+                to.display()
+            );
+        }
+        let bytes = fs::read(&from).with_context(|| format!("reading {}", from.display()))?;
+        match fs::read(&to) {
+            Ok(existing) if existing == bytes => continue,
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(error).with_context(|| format!("reading {}", to.display()));
+            }
+        }
+        ai_memory_wiki::write_atomic(&to, &bytes)
+            .with_context(|| format!("staging {} → {}", from.display(), to.display()))?;
     }
     Ok(())
 }
@@ -7790,6 +7924,198 @@ model = "gpt-5"
         );
     }
 
+    #[test]
+    fn copy_support_hook_scripts_reinstalls_and_updates_support_bundles() {
+        let tmp = TempDir::new().unwrap();
+        let first = tmp.path().join("bundle-v1/cursor");
+        let next = tmp.path().join("bundle-v2/cursor");
+        for (source, content) in [(&first, "# first\n"), (&next, "# second\n")] {
+            fs::create_dir_all(source).unwrap();
+            let lib = source.parent().unwrap().join("lib");
+            fs::create_dir(&lib).unwrap();
+            fs::write(lib.join("shared.ps1"), content).unwrap();
+        }
+        let dest = tmp.path().join("data/hooks/cursor");
+        let support_dir = dest.parent().unwrap().join("lib");
+        fs::create_dir_all(&support_dir).unwrap();
+        let unrelated = support_dir.join("third-party.ps1");
+        fs::write(&unrelated, b"# keep this helper\n").unwrap();
+
+        for (source, expected) in [
+            (&first, "# first\n"),
+            (&first, "# first\n"),
+            (&next, "# second\n"),
+        ] {
+            copy_support_hook_scripts(source, &dest).unwrap();
+            assert_eq!(
+                fs::read_to_string(support_dir.join("shared.ps1")).unwrap(),
+                expected
+            );
+            assert_eq!(fs::read(&unrelated).unwrap(), b"# keep this helper\n");
+            assert_eq!(fs::read_dir(&support_dir).unwrap().count(), 2);
+        }
+        for (source, expected) in [(&first, "# first\n"), (&next, "# second\n")] {
+            assert_eq!(
+                fs::read_to_string(source.parent().unwrap().join("lib/shared.ps1")).unwrap(),
+                expected
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    fn readonly_support_bundle(root: &Path, content: &[u8]) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+
+        let agent = root.join("cursor");
+        fs::create_dir_all(&agent).unwrap();
+        fs::create_dir_all(root.join("lib")).unwrap();
+        stub_scripts(&agent, &["session-start.sh"]);
+        let support = root.join("lib/shared.ps1");
+        fs::write(&support, content).unwrap();
+        for path in [support, agent.join("session-start.sh")] {
+            fs::set_permissions(path, fs::Permissions::from_mode(0o444)).unwrap();
+        }
+        agent
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stage_hook_scripts_reinstalls_and_updates_readonly_support_bundles() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+        let tmp = TempDir::new().unwrap();
+        let first = readonly_support_bundle(&tmp.path().join("bundle-v1"), b"# first\n");
+        let next = readonly_support_bundle(&tmp.path().join("bundle-v2"), b"# second\n");
+        let data = tmp.path().join("data");
+        let support_dir = data.join("hooks/lib");
+        fs::create_dir_all(&support_dir).unwrap();
+        let unrelated = support_dir.join("third-party.ps1");
+        fs::write(&unrelated, b"# keep this helper\n").unwrap();
+        let target = support_dir.join("shared.ps1");
+
+        stage_hook_scripts_in(&first, "cursor", &data).unwrap();
+        assert_eq!(fs::read(&target).unwrap(), b"# first\n");
+        assert!(
+            !fs::metadata(&target).unwrap().permissions().readonly(),
+            "staged helpers must not inherit immutable source permissions"
+        );
+        let original_inode = fs::metadata(&target).unwrap().ino();
+        stage_hook_scripts_in(&first, "cursor", &data).unwrap();
+        assert_eq!(fs::read(&target).unwrap(), b"# first\n");
+        assert_eq!(
+            fs::metadata(&target).unwrap().ino(),
+            original_inode,
+            "identical support files must not be rewritten"
+        );
+        stage_hook_scripts_in(&next, "cursor", &data).unwrap();
+        assert_eq!(fs::read(&target).unwrap(), b"# second\n");
+        assert_ne!(fs::metadata(&target).unwrap().ino(), original_inode);
+        assert_eq!(fs::read(&unrelated).unwrap(), b"# keep this helper\n");
+        for (source, expected) in [(&first, b"# first\n".as_slice()), (&next, b"# second\n")] {
+            let support = source.parent().unwrap().join("lib/shared.ps1");
+            assert_eq!(fs::read(&support).unwrap(), expected);
+            assert_eq!(
+                fs::metadata(&support).unwrap().permissions().mode() & 0o777,
+                0o444
+            );
+        }
+        assert_eq!(fs::read_dir(&support_dir).unwrap().count(), 2);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn copy_support_hook_scripts_replaces_readonly_destination_without_mutating_old_inode() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+        let tmp = TempDir::new().unwrap();
+        let source = readonly_support_bundle(&tmp.path().join("bundle"), b"# update\n");
+        let dest = tmp.path().join("data/hooks/cursor");
+        let support_dir = dest.parent().unwrap().join("lib");
+        fs::create_dir_all(&support_dir).unwrap();
+        let target = support_dir.join("shared.ps1");
+        fs::write(&target, b"# prior install\n").unwrap();
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o444)).unwrap();
+        let outside = tmp.path().join("old-inode.ps1");
+        fs::hard_link(&target, &outside).unwrap();
+
+        copy_support_hook_scripts(&source, &dest).unwrap();
+
+        assert_eq!(fs::read(&target).unwrap(), b"# update\n");
+        assert_eq!(fs::read(&outside).unwrap(), b"# prior install\n");
+        assert_eq!(
+            fs::metadata(&outside).unwrap().permissions().mode() & 0o777,
+            0o444
+        );
+        assert_ne!(
+            fs::metadata(&target).unwrap().ino(),
+            fs::metadata(&outside).unwrap().ino()
+        );
+        assert!(!fs::metadata(&target).unwrap().permissions().readonly());
+        assert_eq!(fs::read_dir(&support_dir).unwrap().count(), 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn copy_support_hook_scripts_rejects_existing_and_dangling_destination_symlinks() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = TempDir::new().unwrap();
+        let source = readonly_support_bundle(&tmp.path().join("bundle"), b"# managed\n");
+        for exists in [true, false] {
+            let root = tmp
+                .path()
+                .join(if exists { "existing" } else { "dangling" });
+            let support_dir = root.join("hooks/lib");
+            fs::create_dir_all(&support_dir).unwrap();
+            let outside = root.join("outside.ps1");
+            if exists {
+                fs::write(&outside, b"# unrelated\n").unwrap();
+            }
+            let target = support_dir.join("shared.ps1");
+            symlink(&outside, &target).unwrap();
+
+            let error = copy_support_hook_scripts(&source, &root.join("hooks/cursor")).unwrap_err();
+
+            assert!(error.to_string().contains("symlink"), "{error:#}");
+            assert_eq!(fs::read_link(&target).unwrap(), outside);
+            if exists {
+                assert_eq!(fs::read(&outside).unwrap(), b"# unrelated\n");
+            } else {
+                assert!(
+                    !outside.exists(),
+                    "staging must not create a symlink target"
+                );
+            }
+            assert_eq!(fs::read_dir(&support_dir).unwrap().count(), 1);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn copy_support_hook_scripts_rejects_symlinked_support_directory() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = TempDir::new().unwrap();
+        let source = readonly_support_bundle(&tmp.path().join("bundle"), b"# managed\n");
+        let dest = tmp.path().join("data/hooks/cursor");
+        fs::create_dir_all(dest.parent().unwrap()).unwrap();
+        let outside = tmp.path().join("outside");
+        fs::create_dir(&outside).unwrap();
+        fs::write(outside.join("shared.ps1"), b"# unrelated\n").unwrap();
+        let target = dest.parent().unwrap().join("lib");
+        symlink(&outside, &target).unwrap();
+
+        let error = copy_support_hook_scripts(&source, &dest).unwrap_err();
+
+        assert!(error.to_string().contains("symlink"), "{error:#}");
+        assert_eq!(fs::read_link(&target).unwrap(), outside);
+        assert_eq!(
+            fs::read(outside.join("shared.ps1")).unwrap(),
+            b"# unrelated\n"
+        );
+        assert_eq!(fs::read_dir(&outside).unwrap().count(), 1);
+    }
+
     /// Skipping `_lib.sh` is fine — older source bundles without the
     /// marker-walk-up feature should still install cleanly.
     #[test]
@@ -8267,6 +8593,21 @@ model = "gpt-5"
         assert!(plugin.contains("tomlFlag(body, \"default_global\")"));
         assert!(plugin.contains("tomlFlag(body, \"inject_on_session_start\")"));
         assert!(plugin.contains("url.searchParams.set(\"briefing_budget\", briefingBudget)"));
+        // #668: applyMarkerParams resolves scope/settings via the
+        // settings-walk, not the nearest-marker findMarker, so a nested
+        // capture-only marker does not shadow an outer marker's scope.
+        assert!(plugin.contains("function findSettingsMarker"));
+        assert!(plugin.contains("function declaresSettings"));
+        assert!(plugin.contains("const marker = findSettingsMarker(cwd);"));
+        assert!(plugin.contains(
+            "for (const key of [\"workspace\", \"project\", \"project_strategy\", \"drop_subagent_captures\"])"
+        ));
+        assert!(plugin.contains(
+            "for (const key of [\"default_global\", \"inject_on_session_start\", \"max_chars\"])"
+        ));
+        assert!(
+            plugin.contains("if (declaresSettings(readFileSync(marker, \"utf8\"))) return marker;")
+        );
         assert!(plugin.contains(
             "applyMarkerParams(url, typeof payload.cwd === \"string\" ? payload.cwd : undefined);"
         ));
@@ -8473,6 +8814,10 @@ model = "gpt-5"
             plugin.contains("if (repoProject) project = repoProject;"),
             "{plugin}"
         );
+        assert!(
+            plugin.contains("const marker = findSettingsMarker(cwd);"),
+            "the default-strategy variant must also walk past a capture-only marker (#668): {plugin}"
+        );
     }
 
     #[test]
@@ -8590,6 +8935,16 @@ model = "gpt-5"
         assert!(extension.contains("tomlFlag(body, \"default_global\")"));
         assert!(extension.contains("tomlFlag(body, \"inject_on_session_start\")"));
         assert!(extension.contains("url.searchParams.set(\"briefing_budget\", briefingBudget)"));
+        // #668: same settings-walk as the OpenCode plugin (shared
+        // `ts_apply_marker_params`), so a nested capture-only marker does
+        // not shadow an outer marker's scope for the OMP/pi extensions.
+        assert!(extension.contains("function findSettingsMarker"));
+        assert!(extension.contains("function declaresSettings"));
+        assert!(extension.contains("const marker = findSettingsMarker(cwd);"));
+        assert!(
+            extension
+                .contains("if (declaresSettings(readFileSync(marker, \"utf8\"))) return marker;")
+        );
         assert!(extension.contains(
             "applyMarkerParams(url, typeof payload.cwd === \"string\" ? payload.cwd : undefined);"
         ));
@@ -8610,6 +8965,22 @@ model = "gpt-5"
                 .contains("projectStrategy === \"repo-root\" || projectStrategy === \"repo_root\"")
         );
         assert!(extension.contains("url.searchParams.set(\"project\", repoProject)"));
+        // #676: pi/omp await session_shutdown's dispose flush instead of
+        // returning immediately, so the runtime teardown that follows a sync
+        // handler no longer kills the in-flight session-end fetch.
+        assert!(extension.contains("const HOOK_DISPOSE_DRAIN_BUDGET_MS = 2000;"));
+        assert!(extension.contains("let hookDrainPromise: Promise<void> | undefined;"));
+        assert!(extension.contains("function requestHookDrain(): Promise<void>"));
+        assert!(extension.contains("function disposeDrainTimeout(): Promise<void>"));
+        assert!(extension.contains("async function drainHookQueueForDispose(): Promise<void>"));
+        assert!(
+            extension.contains("api.on(\"session_shutdown\", async (_event: any, ctx: any) => {")
+        );
+        assert!(extension.contains("await drainHookQueueForDispose();"));
+        assert!(
+            !extension.contains("api.on(\"session_shutdown\", (_event: any, ctx: any) => {"),
+            "session_shutdown must not regress to the sync fire-and-forget form: {extension}"
+        );
     }
 
     #[test]
@@ -8627,6 +8998,10 @@ model = "gpt-5"
         assert!(
             extension.contains("if (!projectStrategy) projectStrategy = DEFAULT_PROJECT_STRATEGY;"),
             "{extension}"
+        );
+        assert!(
+            extension.contains("const marker = findSettingsMarker(cwd);"),
+            "the default-strategy variant must also walk past a capture-only marker (#668): {extension}"
         );
     }
 
@@ -9037,6 +9412,20 @@ model = "gpt-5"
         assert!(!extension.contains(".omp"));
         assert!(!extension.contains("serve --transport stdio"));
         assert!(!extension.contains("serve --stdio"));
+        // #676: the pi string-transform (api.on( -> pi.on() must still
+        // produce an async session_shutdown handler that awaits the bounded
+        // dispose flush, mirroring the omp source it derives from.
+        assert!(extension.contains("const HOOK_DISPOSE_DRAIN_BUDGET_MS = 2000;"));
+        assert!(extension.contains("function requestHookDrain(): Promise<void>"));
+        assert!(extension.contains("async function drainHookQueueForDispose(): Promise<void>"));
+        assert!(
+            extension.contains("pi.on(\"session_shutdown\", async (_event: any, ctx: any) => {")
+        );
+        assert!(extension.contains("await drainHookQueueForDispose();"));
+        assert!(
+            !extension.contains("pi.on(\"session_shutdown\", (_event: any, ctx: any) => {"),
+            "session_shutdown must not regress to the sync fire-and-forget form: {extension}"
+        );
     }
 
     #[test]
@@ -9170,6 +9559,34 @@ model = "gpt-5"
     }
 
     #[test]
+    fn prime_extension_keeps_refinement_capture_with_async_shutdown_drain() {
+        let extension =
+            build_prime_agent_extension("http://127.0.0.1:49374", Some("tok"), None, "denylist");
+
+        assert!(extension.contains("const HOOK_DISPOSE_DRAIN_BUDGET_MS = 2000;"));
+        assert!(
+            extension.contains("await Promise.race([requestHookDrain(), disposeDrainTimeout()]);")
+        );
+        assert!(extension.contains(
+            r#"pi.on("session_shutdown", async (_event: any, ctx: any) => {
+    startSession(ctx);
+    postHook("session-end", sessionPayload(ctx));
+    await drainHookQueueForDispose();
+  });"#
+        ));
+        assert!(extension.contains(&PRIME_REFINEMENT_HANDLER.replace("api.on(", "pi.on(")));
+        assert_eq!(extension.matches("pi.on(\"refine_complete\"").count(), 1);
+        assert!(!extension.contains("session_before_refine"));
+
+        for extension in [
+            build_omp_extension("http://127.0.0.1:49374", None, None, "denylist"),
+            build_pi_extension("http://127.0.0.1:49374", None, None, "denylist"),
+        ] {
+            assert!(!extension.contains("refine_complete"));
+        }
+    }
+
+    #[test]
     fn prime_extension_resolves_token_at_runtime_when_not_embedded() {
         let extension =
             build_prime_agent_extension("http://127.0.0.1:49374", None, None, "denylist");
@@ -9207,15 +9624,14 @@ model = "gpt-5"
         assert!(extension.contains("postHook(\"pre-compact\""));
         assert!(extension.contains("postHook(\"stop\""));
         assert!(extension.contains("postHook(\"session-end\""));
-        // Refinement lifecycle rides the tolerant extension channel
+        // Supported refinement completion rides the tolerant extension channel
         // pending a canonical enum decision.
-        assert!(extension.contains("pi.on(\"session_before_refine\""));
+        assert!(!extension.contains("session_before_refine"));
         assert!(extension.contains("pi.on(\"refine_complete\""));
         assert!(extension.contains("function postExtensionHook("));
         assert!(extension.contains("url.searchParams.set(\"event\", \"other\");"));
         assert!(extension.contains("url.searchParams.set(\"extension\", AGENT);"));
         assert!(extension.contains("url.searchParams.set(\"source_event\", sourceEvent);"));
-        assert!(extension.contains("postExtensionHook(\"session_before_refine\""));
         assert!(extension.contains("postExtensionHook(\"refine_complete\""));
         assert!(extension.contains("fetchHandoff"));
         assert!(extension.contains("customType: \"ai-memory-handoff\""));

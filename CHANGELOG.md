@@ -8,6 +8,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- Added locked native Nix packaging with a shared Rust toolchain, core-library
+  tests, and an isolated provider-free HTTP/MCP package check. (#2)
 - Prime-agent lifecycle capture and MCP tools via a generated TypeScript
   extension. `install-hooks --agent prime-agent --apply` (alias `prime`)
   writes `~/.prime/agent/extensions/ai-memory-prime-agent.ts` (or
@@ -20,7 +22,101 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   sibling servers), and `uninstall` removes only the generated file and the
   entry it added.
 
+### Changed
+- The managed routing snippet now states that Claude Code loads `CLAUDE.md` and
+  does not read `AGENTS.md`: a project whose canonical instruction file is
+  `AGENTS.md` needs a bare `@AGENTS.md` import line in `CLAUDE.md`, or the rules
+  written there are absent from context at session start and reach the agent only
+  if it opens the file. `docs/install.md` and `docs/usage.md` carry the same note
+  beside the `--target AGENTS.md` guidance, and this repository's own `CLAUDE.md`
+  now uses the import instead of a prose pointer (#680).
+
 ### Fixed
+- Fixed repeated native hook installation from read-only bundles by atomically
+  replacing shared support scripts without inheriting immutable permissions,
+  while refusing symlinked support destinations. (#3)
+- Kept native hook reinstallation and removal consistent for renamed binaries
+  by recognizing the exact running executable and hook command signature,
+  without matching unrelated executable names or argument paths. (#3)
+- Removed the unsupported Prime-agent `session_before_refine` subscription
+  from the generated extension, retaining session-scoped `refine_complete`
+  capture through the extension channel alongside the shared asynchronous,
+  bounded session-end drain. (#3)
+- The from-source AUR `PKGBUILD` now builds and tests on constrained AUR
+  builders. Release LTO was disabled (`options=('!debug' '!lto')`) so the
+  final link no longer gets OOM-killed on low-memory build hosts, and the
+  `check()` step pins `CARGO_HOME` to the registry `build()` already
+  populated before it repoints `HOME` at an empty test home, so the
+  `--frozen` test run can resolve the packages it fetched instead of
+  failing offline (#677).
+- CLI server errors now name the request. A non-2xx response from the
+  configured server printed only `server returned 404 Not Found: <body>`,
+  so a failure gave no clue which endpoint answered. The message now leads
+  with the request method and path: `GET /admin/open-sessions: server
+  returned 404 Not Found: <body>`. The error keeps the path only, so a
+  token in the URL userinfo or query string never reaches a log line. (#679)
+- Wiki auto-commits stage what the wiki wrote instead of walking the
+  whole tree, keep the repository open between commits, and no longer
+  drop the commit when another session is writing a file at the same
+  time. A session end now costs what it wrote, not the size of the wiki,
+  and the git history no longer silently misses snapshots under
+  concurrent sessions (#674).
+- The generated pi/omp and OpenClaw TypeScript integrations registered their
+  session-end lifecycle event (`session_shutdown` for pi/omp, `session_end`
+  for OpenClaw) with a synchronous, fire-and-forget handler. The host tears
+  down the runtime as soon as a synchronous handler returns, killing the
+  in-flight `session-end` POST before it completes, so the server never
+  learned the session had ended: `sessions.ended_at` stayed `NULL`, and no
+  summary or handoff was produced. The handlers are now `async` and await a
+  bounded (2s) drain of the pending request(s) before returning, mirroring
+  the joinable dispose-drain already used by the OpenCode integration (#676).
+- The `bin/ai-memory` container wrapper now matches multi-architecture image
+  manifests against the host's platform architecture, eliminating a
+  false-positive "a newer image is available on Docker Hub" warning on x86_64
+  and Podman. Additionally, `emit_docker_run_script` now preserves volume mount
+  modes (such as `:Z` on SELinux/Podman environments) and filters transient
+  runtime environment variables (`HOSTNAME`, `container=podman`). (#673)
+
+## [2.1.1] - 2026-09-07
+
+### Changed
+- The managed routing snippet now states that ai-memory is the cross-harness
+  memory of record: when the surrounding harness has its own local memory
+  feature, durable project facts should be captured in ai-memory rather than
+  duplicated in a harness-local store that other agents cannot see (#671).
+
+### Fixed
+- A nested `.ai-memory.toml` marker whose only content is a `[capture]`
+  section (e.g. one that just sets `ignore_paths`) no longer resets scope
+  resolution to `default` / basename. The native binary, the POSIX shell
+  hooks, and the generated TypeScript integrations all used to resolve
+  `workspace`/`project` and the other forwarded root-level settings
+  (`project_strategy`, `drop_subagent_captures`, `[recall] default_global`,
+  `[briefing]` keys) from the single nearest marker — the same one that
+  decided `[capture]`/`ignore_paths` — so a capture-only marker in a
+  subdirectory silently shadowed an ancestor marker's declared
+  workspace/project and captures landed in the wrong scope. Scope and the
+  other forwarded settings now resolve from the nearest marker that
+  declares more than `[capture]`, while `[capture]`/`ignore_paths` keeps
+  reading the nearest marker unchanged — a marker that declares nothing
+  else is scope/settings-transparent. Applies to the native `ai-memory`
+  binary, the POSIX shell hooks (`hooks/_lib.sh`), and the generated
+  TypeScript integrations for every adapter that resolves scope client-side
+  (OpenCode, OpenCode2, pi, OMP, OpenClaw); outputs remain byte-identical
+  otherwise. (#668)
+- Wiki auto-commits no longer re-hash the whole tree. Since the #594 guard,
+  every commit cleared the git index and re-read every page, so a session
+  end cost the size of the wiki and grew with it; the LongMemEval harness
+  saw its ingest rate fall from 141 to 50 session ends a minute as the tree
+  grew. Staging now goes through libgit2's stat cache and re-hashes the tree
+  only when the tree write fails, which is the #594 case and is now covered
+  by a test that removes a blob from the object store. Commits on one wiki
+  are also serialized: two session ends at once used to collide on the index
+  lock, and the losing snapshot was dropped with a warning. (#665)
+- Preserved typed relation edges in multi-page consolidation. Batch updates
+  now include the same closed `causes` / `fixes` / `contradicts` schema as
+  single-page consolidation and carry non-empty relations into wiki
+  frontmatter and the link index, instead of silently discarding them. (#667)
 - OKF-conformed event ledgers are skipped by the indexer again, so a migrated
   store stops growing without bound. The reserved-file check treated any
   `log.md` / `log-YYYY-MM.md` carrying YAML frontmatter as an ordinary page,
@@ -49,6 +145,46 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   per-event disposition runs. The install-time "enforced"/"NOT in force"
   messaging is corrected to match: a script-fallback install is now the
   only path flagged as unenforced. (#661)
+- A UTF-8 BOM on a hand-edited wiki page that has no frontmatter no longer
+  rides into the page body. `markdown::parse` stripped the mark before looking
+  for the frontmatter fence, but the no-frontmatter path returned the untouched
+  input as the body, so the mark stayed in front of the first line. Two things
+  followed from that: `derive_title` no longer read the leading `# ` as a
+  heading, so the page was indexed under its filename instead of its title, and
+  the OKF v0.2 file pass (which conforms frontmatter and leaves the body alone)
+  re-emitted the mark after the closing `---` fence, where it is a stray
+  zero-width no-break space rather than a byte-order mark. Both paths now drop
+  the leading BOM, which is what the frontmatter path already did. (#663)
+- `serve` no longer re-archives the whole data dir on every start once a
+  monthly log ledger exists. The OKF conformance migration's
+  `nonconformant_files` scan flagged every frontmatter-less `log-YYYY-MM.md`
+  / `log.md` event ledger as a pre-OKF page (`okf::is_conformant` requires a
+  `type` key and a ledger has none), so the pre-migration backup gate saw a
+  non-empty pending list and took a full `tar.gz` snapshot on every boot —
+  the flip side of #660, which taught only the watcher's indexer to skip
+  ledgers by content. The migration scan now shares that same content-gated
+  check (a reserved-looking filename is excluded only when its first body
+  line is a hook log entry), moved into a shared `ledger` module so both
+  call sites stay in sync; a page literally named `log-2026-09.md` whose
+  body is prose is still migrated. (#669)
+- SessionEnd no longer writes an ephemeral `sessions/<id>.md` page for a
+  session that logged no real work. `is_lifecycle_only_session` treated a
+  session as skippable only when every observation was `SessionStart` or
+  `SessionEnd`, so a single `Stop` observation — which OpenCode fires for
+  purely internal work like branch-naming, alongside `session.created` +
+  `session.idle` with no user prompt and no tool use — was enough to make
+  the session look substantive and get a wiki page synthesized for it,
+  flooding the wiki with no-op session pages. "Substantive" is now defined
+  positively instead of negatively: a session counts as real work only if
+  it contains a `UserPrompt`, `PreToolUse`, or `PostToolUse` observation
+  (`is_ephemeral_session` in `ai-memory-hooks`). The atomic store-side
+  check (`end_lifecycle_only_session_in_tx` in `ai-memory-store`) moved to
+  the same positive `kind IN ('user-prompt', 'pre-tool-use',
+  'post-tool-use')` test so the two stay in agreement, and the
+  PreCompact/PostCompaction checkpoint path gates on the same test rather
+  than only `observations.is_empty()`. Provider-agnostic: this fixes the
+  class for any harness that fires lifecycle-only `Stop`/`Notification`
+  events, not just OpenCode. (#662)
 
 ## [2.1.0] - 2026-09-06
 
@@ -5235,7 +5371,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Consolidator used server startup default project instead of the
   session's actual project.
 
-[Unreleased]: https://github.com/akitaonrails/ai-memory/compare/v2.1.0...HEAD
+[Unreleased]: https://github.com/akitaonrails/ai-memory/compare/v2.1.1...HEAD
+[2.1.1]: https://github.com/akitaonrails/ai-memory/compare/v2.1.0...v2.1.1
 [2.1.0]: https://github.com/akitaonrails/ai-memory/compare/v2.0.3...v2.1.0
 [2.0.3]: https://github.com/akitaonrails/ai-memory/compare/v2.0.2...v2.0.3
 [2.0.2]: https://github.com/akitaonrails/ai-memory/releases/tag/v2.0.2

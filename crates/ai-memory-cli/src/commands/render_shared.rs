@@ -1769,6 +1769,33 @@ fn win_double_quote(s: &str) -> String {
     format!("\"{}\"", s.replace('"', ""))
 }
 
+/// Match only a generated native command prefix for this exact executable.
+/// Keep ownership checks on the same quoting rules as the command renderer;
+/// an executable path appearing in an argument does not establish ownership.
+pub(crate) fn native_hook_command_uses_exe(command: &str, exe: &Path) -> bool {
+    let exe = exe.to_string_lossy();
+    if exe.is_empty() {
+        return false;
+    }
+    // Only accept this host's native quoting. Windows double quotes or a bare
+    // space-containing path have different shell semantics on POSIX hosts.
+    let prefixes = if cfg!(windows) {
+        let windows = win_double_quote(&exe);
+        vec![
+            windows.clone(),
+            format!("{}{windows}", powershell_call_operator("codex")),
+            exe.into_owned(),
+        ]
+    } else {
+        vec![shell_quote(&exe)]
+    };
+    prefixes.iter().any(|prefix| {
+        command.strip_prefix(prefix).is_some_and(|rest| {
+            rest.starts_with(" hook --event ") || rest.starts_with(" --data-dir ")
+        })
+    })
+}
+
 /// #515: Codex evaluates its Windows hook command with PowerShell, where a
 /// quoted path in command position is a string expression rather than an
 /// invocation — every hook exited 1 with a ParserError. The call operator
