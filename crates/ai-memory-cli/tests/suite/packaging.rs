@@ -34,17 +34,58 @@ fn read_repo(path: &str) -> String {
 // former Git Bash arms existed to run the wrapper test on Windows, which
 // the fake-uname executable-bit limitation rules out anyway.
 #[cfg(unix)]
-fn shell_script_command(script: &Path) -> Command {
-    Command::new(script)
+fn bash_exe() -> &'static Path {
+    use std::os::unix::fs::PermissionsExt as _;
+    use std::sync::OnceLock;
+
+    static RESOLVED: OnceLock<PathBuf> = OnceLock::new();
+    RESOLVED.get_or_init(|| {
+        let path = std::env::var_os("PATH").expect("packaging tests require Bash on PATH");
+        let bash = std::env::split_paths(&path)
+            .map(|directory| directory.join("bash"))
+            .find(|candidate| {
+                candidate.metadata().is_ok_and(|metadata| {
+                    metadata.is_file() && metadata.permissions().mode() & 0o111 != 0
+                })
+            })
+            .expect("packaging tests require an executable Bash on PATH")
+            .canonicalize()
+            .expect("Bash executable should resolve to an absolute path");
+        assert!(
+            !bash
+                .to_str()
+                .expect("Bash path should be UTF-8")
+                .chars()
+                .any(char::is_whitespace),
+            "fixture shebangs require a Bash path without whitespace"
+        );
+        bash
+    })
 }
 
 #[cfg(unix)]
-// Preserve the script path as `$0` without directly execing a just-written file,
-// which can transiently return ETXTBSY under parallel Linux test load.
-fn freshly_written_shell_script_command(script: &Path) -> Command {
-    let mut command = Command::new("bash");
+fn shell_script_command(script: &Path) -> Command {
+    // Resolve before a test restricts the child PATH to fake tools. Explicit
+    // Bash also preserves `$0` without relying on /usr/bin/env or execing a
+    // just-written file, which can transiently return ETXTBSY on Linux.
+    let mut command = Command::new(bash_exe());
     command.arg(script);
     command
+}
+
+#[cfg(unix)]
+fn bash_script(script: &str) -> String {
+    let body = script
+        .strip_prefix("#!/usr/bin/env bash\n")
+        .or_else(|| script.strip_prefix("#!/bin/bash\n"))
+        .expect("shell fixture should start with a Bash shebang");
+    format!("#!{}\n{body}", bash_exe().display())
+}
+
+#[cfg(unix)]
+fn write_shell_script(path: impl AsRef<Path>, script: impl AsRef<str>) -> std::io::Result<()> {
+    // Runtime-generated fakes cannot be handled by a build-time shebang patch.
+    std::fs::write(path, bash_script(script.as_ref()))
 }
 
 #[cfg(unix)]
@@ -63,7 +104,7 @@ fn run_wrapper_on_fake_macos(args: &[&str]) -> String {
     let docker_args = tmp.path().join("docker-args.txt");
     let docker = tmp.path().join("docker");
     let uname = tmp.path().join("uname");
-    std::fs::write(
+    write_shell_script(
         &docker,
         format!(
             "#!/usr/bin/env bash\nprintf '%s\\n' \"$@\" > {}\n",
@@ -71,7 +112,7 @@ fn run_wrapper_on_fake_macos(args: &[&str]) -> String {
         ),
     )
     .unwrap();
-    std::fs::write(&uname, "#!/usr/bin/env bash\nprintf 'Darwin\\n'\n").unwrap();
+    write_shell_script(&uname, "#!/usr/bin/env bash\nprintf 'Darwin\\n'\n").unwrap();
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -221,6 +262,28 @@ fn aur_packages_install_all_native_assets() {
         );
     }
 
+    // The from-source PKGBUILD builds and runs `check()` on the AUR host.
+    // Two things keep that green (see #677): `!lto` avoids the release-LTO
+    // link step that OOM-killed the build on constrained AUR builders, and
+    // pinning CARGO_HOME to the real registry before the HOME override lets
+    // the `--frozen` check() resolve the packages build() already fetched.
+    let src_pkgbuild = read_repo("packaging/aur/PKGBUILD");
+    assert!(
+        src_pkgbuild.contains("options=('!debug' '!lto')"),
+        "from-source PKGBUILD must disable LTO to survive constrained AUR builders"
+    );
+    let cargo_home = src_pkgbuild
+        .find("export CARGO_HOME=")
+        .expect("check() must pin CARGO_HOME");
+    let home_override = src_pkgbuild
+        .find(r#"export HOME="$srcdir/test-home""#)
+        .expect("check() must override HOME");
+    assert!(
+        cargo_home < home_override,
+        "CARGO_HOME must be pinned to the real registry before HOME is repointed, \
+         or --frozen check() cannot resolve the fetched packages"
+    );
+
     let install = read_repo("packaging/aur/ai-memory.install");
     assert!(install.contains("sudo -u ai-memory ai-memory --data-dir /var/lib/ai-memory"));
     assert!(!install.contains("sudo ai-memory --data-dir /var/lib/ai-memory"));
@@ -303,7 +366,7 @@ fn run_wrapper_with_piped_stdin(args: &[&str], stdin_payload: &str) -> String {
     let tmp = tempfile::tempdir().unwrap();
     let docker_args = tmp.path().join("docker-args.txt");
     let docker = tmp.path().join("docker");
-    std::fs::write(
+    write_shell_script(
         &docker,
         format!(
             "#!/usr/bin/env bash\nprintf '%s\\n' \"$@\" > {}\n",
@@ -429,13 +492,12 @@ fn posix_wrapper_auto_selects_podman_when_docker_is_unavailable() {
     ];
     for (name, body) in scripts {
         let path = tmp.path().join(name);
-        std::fs::write(&path, body).unwrap();
+        write_shell_script(&path, body).unwrap();
         use std::os::unix::fs::PermissionsExt as _;
         std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
     }
 
-    let output = Command::new("/bin/bash")
-        .arg(repo_root().join("bin/ai-memory"))
+    let output = shell_script_command(&repo_root().join("bin/ai-memory"))
         .arg("status")
         .env("PATH", tmp.path())
         .env("HOME", tmp.path())
@@ -633,7 +695,7 @@ fn installed_hook_names(agent_arg: &str, canonical_agent: &str, hooks: &[&str]) 
     let bundle = tmp.path().join("bundle/hooks").join(canonical_agent);
     std::fs::create_dir_all(&bundle).unwrap();
     for hook in hooks {
-        std::fs::write(
+        write_shell_script(
             bundle.join(format!("{hook}.sh")),
             format!("#!/usr/bin/env bash\nprintf '{hook}\\n'\n"),
         )
@@ -653,7 +715,7 @@ fn installed_hook_names(agent_arg: &str, canonical_agent: &str, hooks: &[&str]) 
     let bin_dir = tmp.path().join("bin");
     std::fs::create_dir_all(&bin_dir).unwrap();
     let curl = bin_dir.join("curl");
-    std::fs::write(
+    write_shell_script(
         &curl,
         "#!/usr/bin/env bash\n\
          set -euo pipefail\n\
@@ -860,7 +922,7 @@ fn run_wrapper_with_fake_docker_env(
             \x20 exit 125\n"
         ),
     };
-    std::fs::write(
+    write_shell_script(
         &docker,
         format!(
             "#!/usr/bin/env bash\n\
@@ -873,13 +935,13 @@ fn run_wrapper_with_fake_docker_env(
     )
     .unwrap();
     if let Some(uname_stdout) = uname_stdout {
-        std::fs::write(
+        write_shell_script(
             &uname,
             format!("#!/usr/bin/env bash\nprintf '{}\\n'\n", uname_stdout),
         )
         .unwrap();
     }
-    std::fs::write(
+    write_shell_script(
         &id,
         "#!/usr/bin/env bash\n\
          case \"$1\" in\n\
@@ -889,7 +951,7 @@ fn run_wrapper_with_fake_docker_env(
          esac\n",
     )
     .unwrap();
-    std::fs::write(
+    write_shell_script(
         &getenforce,
         format!(
             "#!/usr/bin/env bash\nprintf '{}\\n'\n",
@@ -1138,13 +1200,13 @@ mod slow {
         std::fs::write(&wrapper, &original).unwrap();
 
         let payload = tmp.path().join("hostile-wrapper");
-        std::fs::write(
+        write_shell_script(
             &payload,
             "#!/usr/bin/env bash\nprintf 'hostile payload executed\\n' >&2\nexit 91\n",
         )
         .unwrap();
         let curl = bin_dir.join("curl");
-        std::fs::write(
+        write_shell_script(
             &curl,
             "#!/usr/bin/env bash\n\
          set -euo pipefail\n\
@@ -1164,7 +1226,7 @@ mod slow {
         )
         .unwrap();
         let docker = bin_dir.join("docker");
-        std::fs::write(&docker, "#!/usr/bin/env bash\nexit 0\n").unwrap();
+        write_shell_script(&docker, "#!/usr/bin/env bash\nexit 0\n").unwrap();
         {
             use std::os::unix::fs::PermissionsExt as _;
             for path in [&wrapper, &payload, &curl, &docker] {
@@ -1177,7 +1239,7 @@ mod slow {
             shell_path(&bin_dir),
             std::env::var("PATH").unwrap_or_default()
         );
-        let output = freshly_written_shell_script_command(&wrapper)
+        let output = shell_script_command(&wrapper)
             .arg("upgrade")
             .env("PATH", path)
             .env("HOME", tmp.path())
@@ -1208,13 +1270,26 @@ mod slow {
         let bin_dir = tmp.path().join("bin");
         std::fs::create_dir_all(&bin_dir).unwrap();
         let wrapper = bin_dir.join("ai-memory");
-        std::fs::write(&wrapper, read_repo("bin/ai-memory")).unwrap();
+        let mut wrapper_body = read_repo("bin/ai-memory");
+        if !Path::new("/usr/bin/env").is_file() {
+            // Keep the release payload's exact shebang for the checksum and
+            // header checks. Only the scratch wrapper's re-exec needs the Bash
+            // already selected by shell_script_command in a hermetic build.
+            let reexec = "AI_MEMORY_SKIP_SELF_UPGRADE=1 exec \"${script_path}\" upgrade";
+            assert_eq!(wrapper_body.matches(reexec).count(), 1);
+            wrapper_body = wrapper_body.replacen(
+                reexec,
+                "AI_MEMORY_SKIP_SELF_UPGRADE=1 exec \"${BASH}\" \"${script_path}\" upgrade",
+                1,
+            );
+        }
+        std::fs::write(&wrapper, wrapper_body).unwrap();
 
         let payload = tmp.path().join("verified-wrapper");
         let payload_body = "#!/usr/bin/env bash\nprintf 'verified wrapper executed\\n'\n";
         std::fs::write(&payload, payload_body).unwrap();
         let curl = bin_dir.join("curl");
-        std::fs::write(
+        write_shell_script(
             &curl,
             "#!/usr/bin/env bash\n\
          set -euo pipefail\n\
@@ -1245,7 +1320,7 @@ mod slow {
             shell_path(&bin_dir),
             std::env::var("PATH").unwrap_or_default()
         );
-        let output = freshly_written_shell_script_command(&wrapper)
+        let output = shell_script_command(&wrapper)
             .arg("upgrade")
             .env("PATH", path)
             .env("HOME", tmp.path())
@@ -1274,7 +1349,7 @@ mod slow {
         let bin_dir = tmp.path().join("bin");
         std::fs::create_dir_all(&bin_dir).unwrap();
         let curl = bin_dir.join("curl");
-        std::fs::write(
+        write_shell_script(
             &curl,
             "#!/usr/bin/env bash\n\
          set -euo pipefail\n\
@@ -1367,7 +1442,7 @@ mod slow {
         let docker = tmp.path().join("docker");
         let record = tmp.path().join("native-record.txt");
         let docker_record = tmp.path().join("docker-record.txt");
-        std::fs::write(
+        write_shell_script(
         &native,
         format!(
             "#!/usr/bin/env bash\n\
@@ -1378,7 +1453,7 @@ mod slow {
         ),
     )
     .unwrap();
-        std::fs::write(
+        write_shell_script(
             &docker,
             format!(
                 "#!/usr/bin/env bash\nprintf '%s\\n' \"$@\" > {}\nexit 99\n",
@@ -1440,7 +1515,7 @@ mod slow {
     fn wrapper_upgrade_does_not_claim_an_updated_remote_server_is_stale() {
         let tmp = tempfile::tempdir().unwrap();
         let docker = tmp.path().join("docker");
-        std::fs::write(
+        write_shell_script(
             &docker,
             "#!/usr/bin/env bash\n\
          case \"$1\" in\n\
@@ -1478,7 +1553,7 @@ mod slow {
     fn docker_wrapper_completions_tolerate_an_early_reader_close() {
         let tmp = tempfile::tempdir().unwrap();
         let docker = tmp.path().join("docker");
-        std::fs::write(
+        write_shell_script(
             &docker,
             "#!/usr/bin/env bash\n\
          if [ \"$1\" = info ]; then\n\
@@ -1536,7 +1611,7 @@ mod slow {
     fn docker_wrapper_completions_preserve_helper_failure_without_partial_output() {
         let tmp = tempfile::tempdir().unwrap();
         let docker = tmp.path().join("docker");
-        std::fs::write(
+        write_shell_script(
             &docker,
             "#!/usr/bin/env bash\n\
          if [ \"$1\" = info ]; then\n\

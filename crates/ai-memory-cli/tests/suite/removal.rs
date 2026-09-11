@@ -1,7 +1,7 @@
 //! End-to-end: add hooks into a temp HOME, then remove them, and
 //! assert the file round-trips (our entries gone, third-party intact).
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::{Mutex, MutexGuard};
 
@@ -15,6 +15,16 @@ fn cli_test_lock() -> MutexGuard<'static, ()> {
 
 fn bin() -> &'static str {
     env!("CARGO_BIN_EXE_ai-memory")
+}
+
+fn hooks_bundle() -> PathBuf {
+    // Installation is setup for removal assertions, not an executable-layout
+    // discovery test. Cargo may place binaries under a target-triple directory.
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(Path::parent)
+        .expect("crate should live under crates/ai-memory-cli")
+        .join("hooks")
 }
 
 fn command_with_home(home: &Path) -> Command {
@@ -96,6 +106,8 @@ fn install_then_uninstall_round_trip_claude_hooks() {
     // Install ai-memory hooks for Claude Code.
     let status = command_with_home(home.path())
         .args(["install-hooks", "--agent", "claude-code", "--apply"])
+        .arg("--hooks-dir")
+        .arg(hooks_bundle())
         .status()
         .unwrap();
     assert!(status.success(), "install-hooks failed");
@@ -141,11 +153,11 @@ fn relocated_claude_uninstall_sweeps_active_and_legacy_installs() {
         if relocate {
             command.env("CLAUDE_CONFIG_DIR", &relocated);
         }
-        command
-            .args(args)
-            .current_dir(project.path())
-            .output()
-            .unwrap()
+        command.args(args);
+        if args.first() == Some(&"install-hooks") {
+            command.arg("--hooks-dir").arg(hooks_bundle());
+        }
+        command.current_dir(project.path()).output().unwrap()
     };
 
     for relocate in [false, true] {

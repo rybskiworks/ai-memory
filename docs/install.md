@@ -124,6 +124,12 @@ legacy long snippets between `<!-- ai-memory:start -->` /
 `<!-- ai-memory:end -->` are replaced in place with the slim snippet, and
 managed Agent Skills are installed or updated alongside it.
 
+If you install into `AGENTS.md` and the project is also used from Claude Code,
+make `CLAUDE.md` import it with a bare `@AGENTS.md` first line. Claude Code
+loads `CLAUDE.md` and does not read `AGENTS.md`, so without that import the
+installed block is absent from context at session start. See
+[Claude Code memory](https://code.claude.com/docs/en/memory#agents-md).
+
 ---
 
 ## Configuring the CLI URL and auth
@@ -1268,10 +1274,18 @@ ai-memory install-mcp --client prime-agent --apply \
 # (`--agent prime` / `--client prime` are accepted as aliases.)
 ```
 
-Restart prime-agent after installing or changing the extension. The
-refinement lifecycle (`session_before_refine`, `refine_complete`) is captured
-through the extension channel until prime-agent documents a canonical hook
-event for it.
+Restart prime-agent after installing or changing the extension. Prime-agent
+emits `refine_complete` after applying and persisting a refinement; its
+extension API does not expose a pre-refine event. The adapter records that
+completion with the session identity through ai-memory's extension channel
+(`event=other`, `source_event=refine_complete`). It does not capture the
+refinement summary or edits. Prime's local/global refinement scope describes
+its harness settings, not the memory project's scope or authorization.
+
+The asynchronous `session_shutdown` handler posts `session-end` and awaits the
+shared hook queue for up to two seconds before returning. This bounded drain
+coexists with refinement capture; it is best-effort delivery, not a guarantee
+that every queued observation has committed before the harness exits.
 
 ### Bind mounts vs docker cp
 
@@ -2376,6 +2390,22 @@ image, re-stages hook scripts under
 prints how to restart the server container so the new binary is used.
 Re-running `install-hooks --apply` remains idempotent: ai-memory
 replaces only the hook entries it owns and leaves unrelated hooks alone.
+Native command-string hooks also recognize a renamed binary when installation,
+reinstallation and removal use the same executable path. Recognition requires
+that exact generated executable prefix and the native hook flags; an unrelated
+command mentioning the path in an argument is not adopted. If a renamed binary
+is moved, review its old hook entries rather than assuming another executable
+path can identify them automatically.
+
+Shared PowerShell support scripts staged by `install-hooks` are replaced
+atomically without inheriting a read-only bundle's permissions, so native
+installation can be repeated against an immutable Nix package. Identical
+support files are left untouched. Symlinks at the managed support file or
+its `lib/` directory are refused without modifying their targets; this does
+not change support for symlinked agent configuration files. On Windows, a
+changed legacy destination explicitly marked read-only can still be refused
+by the filesystem; installation does not clear that attribute automatically.
+
 When a Compose file is found, the wrapper first verifies that its project owns
 the running `ai-memory` container. A standalone container is never handed to an
 unrelated Compose project just because its file occupies a conventional path;
