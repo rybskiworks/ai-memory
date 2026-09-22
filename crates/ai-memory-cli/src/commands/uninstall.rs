@@ -364,6 +364,7 @@ fn build_plan(args: &UninstallArgs) -> anyhow::Result<Vec<PlannedChange>> {
             KiroCli,
             CommandCode,
             Swival,
+            Muse,
         ] {
             let paths = if matches!(client, ClaudeCode) {
                 claude_config_paths(
@@ -737,6 +738,15 @@ fn strip_legacy_orphan_tail(tail: &str) -> &str {
 /// commands invoke the `ai-memory hook --event ... --server-url ...` subcommand.
 /// Keep both signatures narrow so hook overlays and uninstall do not remove
 /// unrelated hooks that happen to use the same event names or script basenames.
+///
+/// The executable name is matched in both its hyphenated (`ai-memory`) and
+/// underscored (`ai_memory`) forms: a native command uses the current
+/// executable's path, and on Windows a test binary (and some packaging) names
+/// it with an underscore, so recognizing only the hyphen made a reapply
+/// non-idempotent — it reported `Updated` and failed to dedup its own prior
+/// entries (#740). The full `hook --event … --agent … --server-url …` argv
+/// signature still gates the match, so this does not broaden to unrelated
+/// commands whose path merely contains the string.
 pub(crate) fn hook_command_is_ours(command: &str) -> bool {
     let exe = std::env::current_exe().ok();
     hook_command_is_ours_with_exe(command, exe.as_deref())
@@ -757,7 +767,28 @@ fn hook_command_is_ours_with_exe(command: &str, exe: Option<&Path>) -> bool {
     // package name. Match that exact generated executable prefix rather than
     // broadening the name heuristic to arbitrary paths or argument values.
     lower.contains("ai-memory")
+        || underscored_native_executable(command)
         || exe.is_some_and(|exe| super::render_shared::native_hook_command_uses_exe(command, exe))
+}
+
+fn underscored_native_executable(command: &str) -> bool {
+    let command = command.trim_start();
+    let command = command.strip_prefix("& ").map_or(command, str::trim_start);
+    let executable = if let Some(quoted) = command.strip_prefix('"') {
+        quoted.split_once('"').map(|(path, _)| path)
+    } else if let Some(quoted) = command.strip_prefix('\'') {
+        quoted.split_once('\'').map(|(path, _)| path)
+    } else {
+        command.split_whitespace().next()
+    };
+    executable.is_some_and(|path| {
+        path.rsplit(['/', '\\']).next().is_some_and(|name| {
+            matches!(name, "ai_memory" | "ai_memory.exe")
+                || (cfg!(windows)
+                    && (name.eq_ignore_ascii_case("ai_memory")
+                        || name.eq_ignore_ascii_case("ai_memory.exe")))
+        })
+    })
 }
 
 fn hook_entry_is_ours(entry: &serde_json::Value) -> bool {
@@ -1149,6 +1180,9 @@ fn mcp_servers_path(client: McpClient) -> Option<&'static [&'static str]> {
         McpClient::PrimeAgent => Some(&["mcpServers"]),
         McpClient::VsCodeCopilot => Some(&["servers"]),
         McpClient::Zed => Some(&["context_servers"]),
+        // Muse Code spells the key snake_case; the camelCase spelling the
+        // clients above use would leave the entry behind.
+        McpClient::Muse => Some(&["mcp_servers"]),
         McpClient::Codex | McpClient::Grok | McpClient::Pi => None,
     }
 }
@@ -1183,16 +1217,14 @@ fn mcp_entry_is_ours(key: &str, entry: &serde_json::Value, name: Option<&str>, u
 /// for clients whose installer appends a schema flavor, the form
 /// `install-mcp` actually writes (`--mcp-url` keeps the unflavored default).
 /// Every other client keeps exact-match semantics.
-fn mcp_url_candidates(client: McpClient, url: &str) -> Vec<String> {
+fn mcp_url_candidates(_client: McpClient, url: &str) -> Vec<String> {
     let mut candidates = vec![url.to_string()];
-    if matches!(client, McpClient::KimiCode) {
-        let flavored = install_mcp::moonshot_flavored_mcp_url(url);
-        if !candidates.contains(&flavored) {
-            candidates.push(flavored);
-        }
-    }
-    if matches!(client, McpClient::KiroCli) {
-        let flavored = install_mcp::bedrock_flavored_mcp_url(url);
+    // Every marker, for every client: `install-mcp --flavor` can write any of
+    // them into any client's config, so keying this off the client's built-in
+    // default would strand the entries an operator pinned by hand. Candidates
+    // that do not appear in the file simply match nothing.
+    for marker in install_mcp::FLAVOR_MARKERS {
+        let flavored = install_mcp::flavored_mcp_url_for_marker(url, marker);
         if !candidates.contains(&flavored) {
             candidates.push(flavored);
         }
@@ -1544,6 +1576,20 @@ mod tests {
     fn hook_signature_matches_a_powershell_call_operator_command() {
         let cmd = r#"& "C:\Users\alice\bin\ai-memory.exe" --data-dir "C:\Users\alice\AppData\Local\ai-memory" hook --event session-start --agent codex --server-url "http://h:49374""#;
         assert!(hook_command_is_ours(cmd));
+    }
+
+    #[test]
+    fn hook_signature_matches_underscore_executable_name() {
+        // On Windows a test binary (and some packaging) names the executable
+        // `ai_memory` rather than `ai-memory`; the native command then uses that
+        // path. Recognizing only the hyphen made a reapply non-idempotent (#740).
+        let cmd = r#""C:\Users\alice\target\debug\ai_memory.exe" hook --event session-start --agent kimi-code --server-url "http://h:49374""#;
+        assert!(hook_command_is_ours(cmd));
+        // The argv signature still gates it: an unrelated `ai_memory`-named tool
+        // without our hook subcommand is not claimed.
+        assert!(!hook_command_is_ours(
+            r#""C:\bin\ai_memory_helper.exe" --do-something-else"#
+        ));
     }
 
     #[test]
@@ -2334,31 +2380,48 @@ command = "'/usr/local/bin/ai-memory' hook --event stop --agent kimi-code --serv
     }
 
     #[test]
-    fn mcp_url_candidates_adds_client_schema_flavors() {
+    fn mcp_url_candidates_covers_every_installable_flavor() {
+        // Was keyed off the client's built-in default. `install-mcp --flavor`
+        // can now write any marker into any client's config, so candidates are
+        // keyed off what the installer can write instead — otherwise an entry
+        // an operator pinned by hand survives `uninstall`.
         assert_eq!(
             mcp_url_candidates(McpClient::KimiCode, "http://127.0.0.1:49374/mcp"),
             vec![
                 "http://127.0.0.1:49374/mcp".to_string(),
-                "http://127.0.0.1:49374/mcp?flavor=moonshot".to_string()
+                "http://127.0.0.1:49374/mcp?flavor=moonshot".to_string(),
+                "http://127.0.0.1:49374/mcp?flavor=bedrock".to_string(),
+                "http://127.0.0.1:49374/mcp?flavor=gemini".to_string(),
             ]
+        );
+        // An already-flavored URL is not duplicated into the list.
+        assert_eq!(
+            mcp_url_candidates(
+                McpClient::KimiCode,
+                "http://127.0.0.1:49374/mcp?flavor=moonshot"
+            )[0],
+            "http://127.0.0.1:49374/mcp?flavor=moonshot".to_string()
         );
         assert_eq!(
             mcp_url_candidates(
                 McpClient::KimiCode,
                 "http://127.0.0.1:49374/mcp?flavor=moonshot"
-            ),
-            vec!["http://127.0.0.1:49374/mcp?flavor=moonshot".to_string()]
+            )
+            .iter()
+            .filter(|c| c.ends_with("flavor=moonshot"))
+            .count(),
+            1
         );
-        assert_eq!(
-            mcp_url_candidates(McpClient::KiroCli, "https://memory.example/mcp"),
-            vec![
-                "https://memory.example/mcp".to_string(),
-                "https://memory.example/mcp?flavor=bedrock".to_string()
-            ]
+        // The case the broadening exists for: Command Code has no default
+        // flavor, but an operator on a Vertex-backed model pins one.
+        assert!(
+            mcp_url_candidates(McpClient::CommandCode, "https://memory.example/mcp")
+                .contains(&"https://memory.example/mcp?flavor=gemini".to_string())
         );
-        assert_eq!(
-            mcp_url_candidates(McpClient::Cursor, "http://127.0.0.1:49374/mcp"),
-            vec!["http://127.0.0.1:49374/mcp".to_string()]
+        // Kiro's own default is still matched.
+        assert!(
+            mcp_url_candidates(McpClient::KiroCli, "https://memory.example/mcp")
+                .contains(&"https://memory.example/mcp?flavor=bedrock".to_string())
         );
     }
 

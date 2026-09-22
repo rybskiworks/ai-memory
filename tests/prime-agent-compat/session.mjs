@@ -54,6 +54,9 @@ async function run(input) {
       };
       if (url.pathname === "/mcp") {
         assert.ok(["initialize", "notifications/initialized", "tools/list", "tools/call"].includes(body?.method));
+        if (body.method === "notifications/initialized") {
+          assert.equal(Object.hasOwn(body, "id"), false, "MCP notifications must not carry a request ID");
+        }
         if (body.method === "tools/call") {
           assert.equal(body.params?.name, "memory_query", "fixture may call only the real read query tool");
           observed.tool_name = body.params.name;
@@ -70,6 +73,9 @@ async function run(input) {
       result.requests.push(observed);
       const response = await nativeFetch(resource, options);
       observed.status = response.status;
+      if (body?.method === "notifications/initialized") {
+        assert.equal(response.status, 202, "the native server must accept the notification without an RPC result");
+      }
       return response;
     } catch (error) {
       result.guard_errors.push(String(error));
