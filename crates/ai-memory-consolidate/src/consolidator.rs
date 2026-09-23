@@ -2895,8 +2895,9 @@ mod tests {
     /// which is atomic — one bad page there lost every page in the batch
     /// (#848).
     #[tokio::test]
-    async fn batch_with_illegal_char_path_is_sanitized_not_aborted() {
-        let tmp = tempfile::tempdir().unwrap();
+    async fn batch_with_illegal_char_path_is_sanitized_not_aborted()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let tmp = tempfile::tempdir()?;
         let (store, wiki, session, ws, proj) = batch_fixture(tmp.path()).await;
         let response = serde_json::json!({
             "rationale": "one bad path, one good",
@@ -2935,8 +2936,7 @@ mod tests {
             None,
             None,
         )
-        .await
-        .expect("a sanitizable bad path must not fail (or abort) the whole batch");
+        .await?;
 
         assert_eq!(
             outcomes.len(),
@@ -2947,7 +2947,11 @@ mod tests {
         let sanitized_path = outcomes
             .iter()
             .find(|o| o.path.as_str().starts_with("concepts/build"))
-            .expect("the offending page must still be written, under a sanitized path")
+            .ok_or_else(|| {
+                std::io::Error::other(
+                    "the offending page must still be written, under a sanitized path",
+                )
+            })?
             .path
             .clone();
         assert!(
@@ -2960,13 +2964,12 @@ mod tests {
             "the sanitized path must pass the portability check"
         );
 
-        let good = wiki
-            .read_page(ws, proj, &PagePath::new("concepts/good.md").unwrap())
-            .unwrap();
+        let good = wiki.read_page(ws, proj, &PagePath::new("concepts/good.md")?)?;
         assert_eq!(good.frontmatter["title"], "Good path page");
 
-        let bad = wiki.read_page(ws, proj, &sanitized_path).unwrap();
+        let bad = wiki.read_page(ws, proj, &sanitized_path)?;
         assert_eq!(bad.frontmatter["title"], "Bad path page");
+        Ok(())
     }
 
     /// A batch whose single update targets `path` — the model chooses this

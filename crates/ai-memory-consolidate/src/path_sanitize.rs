@@ -49,7 +49,8 @@ mod tests {
     use super::slugify_page_path;
 
     #[test]
-    fn slugify_page_path_replaces_illegal_chars_and_keeps_slashes() {
+    fn slugify_page_path_replaces_illegal_chars_and_keeps_slashes()
+    -> Result<(), Box<dyn std::error::Error>> {
         assert_eq!(
             slugify_page_path("concepts/build(sandbox): orchestrate the run.md"),
             "concepts/build(sandbox)- orchestrate the run.md"
@@ -63,5 +64,6 @@ mod tests {
             "concepts/clean-path.md",
             "an already-portable path must be left unchanged"
         );
+        Ok(())
     }
 }
