@@ -27,6 +27,7 @@ pub mod backfill;
 pub mod backup;
 pub mod bootstrap;
 pub mod checkpoints;
+mod codex_hook_generations;
 pub mod commit;
 pub mod compact;
 pub mod completions;

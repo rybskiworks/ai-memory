@@ -26,6 +26,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   entry it added.
 
 ### Fixed
+- Published complete, immutable Codex hook generations so concurrent installers
+  no longer deleted or rewrote one another's scripts; retained prior generations
+  for existing hook configurations and in-flight hooks.
 - Sent generated extension MCP notifications without request IDs and accepted
   their empty success responses, avoiding initialization method errors. (#5)
 - `companions/ai-memory-macos/build.sh` no longer fails on machines whose

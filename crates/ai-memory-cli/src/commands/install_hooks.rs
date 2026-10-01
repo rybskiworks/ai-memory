@@ -2081,7 +2081,10 @@ fn apply_to_codex_settings(
     data_dir: &Path,
     args: &InstallHooksArgs,
 ) -> Result<()> {
-    let staged = stage_hook_scripts(hooks_dir, "codex", data_dir)?;
+    let staged = super::codex_hook_generations::stage(
+        hooks_dir,
+        &hook_staging_root(data_dir, ai_memory_wiki::backup::running_in_container()),
+    )?;
     apply_to_codex_settings_with_staged(&staged, server_url, auth_token, data_dir, args)
 }
 
@@ -2094,7 +2097,7 @@ fn apply_to_codex_settings_in(
     staging_data_local: &Path,
     args: &InstallHooksArgs,
 ) -> Result<()> {
-    let staged = stage_hook_scripts_in(hooks_dir, "codex", staging_data_local)?;
+    let staged = super::codex_hook_generations::stage(hooks_dir, staging_data_local)?;
     let command_dir = staged_command_dir(&staged, "codex");
     let payload = crate::commands::render_shared::build_profile_script_payload_for_test(
         &super::render_shared::CODEX_PROFILE,
@@ -5297,7 +5300,11 @@ fn copy_support_hook_scripts(source_dir: &Path, dest_root: &Path) -> Result<()> 
 
 fn staged_command_dir(staged: &Path, agent_label: &str) -> PathBuf {
     match std::env::var("AI_MEMORY_HOOKS_HOST_ROOT") {
-        Ok(root) if !root.trim().is_empty() => PathBuf::from(root).join(agent_label),
+        Ok(root) if !root.trim().is_empty() => PathBuf::from(root).join(
+            super::codex_hook_generations::command_suffix(staged)
+                .filter(|_| agent_label == "codex")
+                .unwrap_or_else(|| PathBuf::from(agent_label)),
+        ),
         _ => staged.to_path_buf(),
     }
 }
@@ -5320,7 +5327,11 @@ fn resolve_hooks_dir(
     if let Some(p) = explicit {
         let path = p.join(sub);
         if path.is_dir() {
-            return Ok(path);
+            return if sub == "codex" {
+                super::codex_hook_generations::source(&path, true)
+            } else {
+                Ok(path)
+            };
         }
         anyhow::bail!("hooks directory {} does not exist", path.display());
     }
@@ -5334,7 +5345,11 @@ fn resolve_hooks_dir(
     );
     for path in &candidates {
         if !path.as_os_str().is_empty() && path.is_dir() {
-            return Ok(path.clone());
+            return if sub == "codex" {
+                super::codex_hook_generations::source(path, false)
+            } else {
+                Ok(path.clone())
+            };
         }
     }
     anyhow::bail!(
@@ -10463,8 +10478,8 @@ model = "gpt-5"
     /// The test-only Codex wrapper must stage scripts under its injected
     /// data-local root and wire that stable path into the generated config.
     #[test]
-    fn codex_apply_stages_into_injected_dir() {
-        let hooks_tmp = TempDir::new().unwrap();
+    fn codex_apply_stages_into_injected_dir() -> Result<()> {
+        let hooks_tmp = TempDir::new()?;
         stub_scripts(
             hooks_tmp.path(),
             &[
@@ -10477,9 +10492,25 @@ model = "gpt-5"
             ],
         );
 
-        let config_tmp = TempDir::new().unwrap();
+        let config_tmp = TempDir::new()?;
         let config_path = config_tmp.path().join("hooks.json");
-        let staging_tmp = TempDir::new().unwrap();
+        let staging_tmp = TempDir::new()?;
+
+        let args = InstallHooksArgs {
+            profile: None,
+            agent: AgentChoice::Codex,
+            capture_assistant: false,
+            no_capture_prompts: false,
+            capture_mode: None,
+            capture_prompts: false,
+            hooks_dir: Some(hooks_tmp.path().to_path_buf()),
+            server_url: Some("http://127.0.0.1:49374".to_string()),
+            auth_token: None,
+            config_file: Some(config_path.clone()),
+            project_strategy: Some(ProjectStrategyArg::Basename),
+            as_user: None,
+            apply: false,
+        };
 
         apply_to_codex_settings_in(
             hooks_tmp.path(),
@@ -10487,46 +10518,44 @@ model = "gpt-5"
             None,
             config_tmp.path(),
             staging_tmp.path(),
-            &InstallHooksArgs {
-                profile: None,
-                agent: AgentChoice::Codex,
-                capture_assistant: false,
-                no_capture_prompts: false,
-                capture_mode: None,
-                capture_prompts: false,
-                hooks_dir: Some(hooks_tmp.path().to_path_buf()),
-                server_url: Some("http://127.0.0.1:49374".to_string()),
-                auth_token: None,
-                config_file: Some(config_path.clone()),
-                project_strategy: Some(ProjectStrategyArg::Basename),
-                as_user: None,
-                apply: false,
-            },
-        )
-        .unwrap();
+            &args,
+        )?;
 
-        let staged_script = staging_tmp
-            .path()
-            .join("hooks")
-            .join("codex")
-            .join("session-start.sh");
+        let staged_script = super::super::codex_hook_generations::source(
+            &staging_tmp.path().join("hooks/codex"),
+            false,
+        )?
+        .join("session-start.sh");
         assert!(
             staged_script.is_file(),
             "expected hook script staged at {}, override was not honoured",
             staged_script.display()
         );
 
-        let parsed: serde_json::Value =
-            serde_json::from_str(&fs::read_to_string(&config_path).unwrap()).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&fs::read_to_string(&config_path)?)?;
         let command = parsed
             .pointer("/hooks/SessionStart/0/hooks/0/command")
             .and_then(serde_json::Value::as_str)
-            .expect("SessionStart command should be present");
+            .context("SessionStart command should be present")?;
         assert!(
             command.contains(&staged_script.to_string_lossy().into_owned()),
             "generated command must reference staged script {}: {command}",
             staged_script.display()
         );
+        let before = fs::read(&config_path)?;
+        let modified = fs::metadata(&config_path)?.modified()?;
+        apply_to_codex_settings_in(
+            hooks_tmp.path(),
+            "http://127.0.0.1:49374",
+            None,
+            config_tmp.path(),
+            staging_tmp.path(),
+            &args,
+        )?;
+        assert_eq!(fs::read(&config_path)?, before);
+        assert_eq!(fs::metadata(&config_path)?.modified()?, modified);
+        assert_eq!(fs::read_dir(config_tmp.path())?.count(), 1);
+        Ok(())
     }
 
     // ----------------------------------------------------------------
