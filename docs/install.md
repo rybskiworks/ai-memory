@@ -787,6 +787,22 @@ including Pi and Zero, have lifecycle capture paths through `install-hooks`.
 
 ### OpenAI Codex
 
+`install-hooks --agent codex --apply` stages a complete bundle under
+`<hook-staging-root>/hooks/codex/.generations/<content-hash>/codex` before
+publishing `hooks.json`. Concurrent installs of the same bundle reuse that
+verified generation. Updates leave older generations and legacy flat bundles
+in place so existing configurations and running hooks keep working. Published
+generations are never rewritten in place; corrupt or incomplete generations
+cause installation to fail rather than silently replacing their contents.
+
+The colocated shell helper and sibling PowerShell `lib/` are part of each
+bundle. Container-to-host path mapping retains the full generation suffix.
+An explicit `--hooks-dir` uses flat event scripts when present (including a
+bundle refreshed by `setup-agent`); automatic data-directory fallback uses the
+last completely published generation. No background cleanup removes old
+bundles or temporary directories left by an interrupted process.
+
+
 ```bash
 # MCP snippet (merge into ~/.codex/config.toml):
 docker run --rm akitaonrails/ai-memory:latest \
