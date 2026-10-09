@@ -164,7 +164,9 @@ pub(crate) fn tool_observation_metadata(
         // ZCode tool payloads carry Claude Code's snake_case aliases
         // (`tool_name`, `tool_use_id`, `tool_input`) alongside the native
         // camelCase — all captured live (engine v0.16.5, #512).
-        AgentKind::ClaudeCode | AgentKind::CommandCode | AgentKind::Zcode => (
+        // Native Codex 0.154 uses these same top-level fields, including
+        // `tool_use_id` on both sides of a tool call.
+        AgentKind::ClaudeCode | AgentKind::CommandCode | AgentKind::Codex | AgentKind::Zcode => (
             object.get("tool_name")?.as_str()?,
             object.get("tool_use_id").and_then(Value::as_str),
         ),
@@ -173,6 +175,10 @@ pub(crate) fn tool_observation_metadata(
             object.get("callID").and_then(Value::as_str),
         ),
         AgentKind::Pi => (
+            object.get("tool")?.as_str()?,
+            object.get("callID").and_then(Value::as_str),
+        ),
+        AgentKind::PrimeAgent => (
             object.get("tool")?.as_str()?,
             object.get("callID").and_then(Value::as_str),
         ),
@@ -206,6 +212,7 @@ pub(crate) fn tool_observation_metadata(
                         agent,
                         AgentKind::ClaudeCode
                             | AgentKind::CommandCode
+                            | AgentKind::Codex
                             | AgentKind::Hermes
                             | AgentKind::KiroCli
                             | AgentKind::Pool
@@ -227,11 +234,13 @@ pub(crate) fn tool_observation_metadata(
 /// Extracts an outcome only where the adapter protocol proves its meaning.
 pub(crate) fn tool_observation_outcome(agent: AgentKind, raw: &Value) -> ToolOutcome {
     match agent {
-        AgentKind::Pi => match raw.get("isError").and_then(Value::as_bool) {
-            Some(true) => ToolOutcome::Error,
-            Some(false) => ToolOutcome::Success,
-            None => ToolOutcome::Unknown,
-        },
+        AgentKind::Pi | AgentKind::PrimeAgent => {
+            match raw.get("isError").and_then(Value::as_bool) {
+                Some(true) => ToolOutcome::Error,
+                Some(false) => ToolOutcome::Success,
+                None => ToolOutcome::Unknown,
+            }
+        }
         AgentKind::KiroCli => match raw
             .get("tool_response")
             .and_then(|response| response.get("success"))
@@ -262,6 +271,9 @@ pub(crate) fn tool_observation_outcome(agent: AgentKind, raw: &Value) -> ToolOut
         {
             ToolOutcome::Error
         }
+        // Codex PostToolUse also fires for failed commands. Its native exec
+        // response is output text, with no separate success/exit-code field;
+        // neither the event nor arbitrary response JSON proves an outcome.
         _ => ToolOutcome::Unknown,
     }
 }
@@ -604,7 +616,7 @@ fn extract(agent: AgentKind, raw: &Value) -> Extracted {
             .get("tool_name")
             .and_then(Value::as_str)
             .map(|name| (name, object.get("tool_input"))),
-        AgentKind::OpenCode | AgentKind::Omp | AgentKind::Pi | AgentKind::OpenClaw => object
+        AgentKind::OpenCode | AgentKind::Omp | AgentKind::Pi | AgentKind::PrimeAgent | AgentKind::OpenClaw => object
             .get("tool")
             .and_then(Value::as_str)
             .map(|name| (name, object.get("args"))),

@@ -105,6 +105,70 @@ pub(crate) fn cursor_hooks_path() -> anyhow::Result<std::path::PathBuf> {
         .join("hooks.json"))
 }
 
+/// True when `~/.cursor/hooks.json` already registers a native ai-memory hook
+/// declared `--agent cursor`.
+///
+/// The Cursor CLI also runs the commands in Claude Code's settings, so on a
+/// host with both installs every Cursor event reaches `ai-memory hook` twice:
+/// once as `--agent cursor` and once as `--agent claude-code` carrying
+/// `cursor_version`. The hook uses this to drop the second copy (#721).
+/// Unreadable or malformed files count as "not installed" so the Claude Code
+/// path keeps capturing Cursor sessions on hosts without Cursor's own hooks.
+pub(crate) fn cursor_native_hooks_installed() -> bool {
+    cursor_hooks_path().is_ok_and(|path| cursor_native_hooks_installed_in(&path))
+}
+
+const MAX_CURSOR_HOOKS_BYTES: u64 = 1024 * 1024;
+
+pub(crate) fn cursor_native_hooks_installed_in(path: &Path) -> bool {
+    use std::io::Read as _;
+    let Ok(file) = fs::File::open(path) else {
+        return false;
+    };
+    let mut raw = String::new();
+    if file
+        .take(MAX_CURSOR_HOOKS_BYTES)
+        .read_to_string(&mut raw)
+        .is_err()
+    {
+        return false;
+    }
+    let Ok(root) = serde_json::from_str::<serde_json::Value>(&raw) else {
+        return false;
+    };
+    root.get("hooks")
+        .and_then(serde_json::Value::as_object)
+        .is_some_and(|hooks| {
+            hooks
+                .values()
+                .filter_map(serde_json::Value::as_array)
+                .flatten()
+                .any(|entry| is_ai_memory_hook_entry(entry) && declares_cursor_agent(entry))
+        })
+}
+
+fn declares_cursor_agent(entry: &serde_json::Value) -> bool {
+    if let Some(args) = entry.get("args").and_then(serde_json::Value::as_array) {
+        return args
+            .windows(2)
+            .any(|pair| pair[0] == "--agent" && pair[1] == "cursor");
+    }
+    entry
+        .get("command")
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|command| {
+            let tokens: Vec<&str> = command
+                .split_whitespace()
+                .map(|t| t.trim_matches(['"', '\'']))
+                .collect();
+            tokens
+                .windows(2)
+                .any(|pair| pair[0] == "--agent" && pair[1] == "cursor")
+                || tokens.contains(&"--agent=cursor")
+                || command.contains("agent=cursor")
+        })
+}
+
 /// `~/.gemini/settings.json`.
 pub(crate) fn gemini_settings_path() -> anyhow::Result<std::path::PathBuf> {
     Ok(home_dir()
@@ -263,6 +327,37 @@ fn pi_extension_path_in(
         .join("ai-memory-pi.ts"))
 }
 
+/// `$PRIME_AGENT_CODING_AGENT_DIR/extensions/ai-memory-prime-agent.ts` when the var
+/// is set, else `~/.prime/agent/extensions/ai-memory-prime-agent.ts` — prime-agent
+/// lifecycle + MCP bridge extension.
+///
+/// `PRIME_AGENT_CODING_AGENT_DIR` overrides prime-agent's user config dir
+/// (`~/.prime/agent`), so extensions written to the default path are never
+/// loaded by a prime-agent configured that way: capture silently does
+/// nothing, with a successful-looking install. Project-local
+/// `.prime/agent/extensions/` is prime-agent's own opt-in (see its
+/// extensions.md); this installer targets the user-global location and
+/// `--config-file` covers a project-local write.
+pub(crate) fn prime_extension_path() -> anyhow::Result<std::path::PathBuf> {
+    prime_extension_path_in(std::env::var_os("PRIME_AGENT_CODING_AGENT_DIR"))
+}
+
+/// The env value comes in as a parameter so tests can exercise both branches
+/// without mutating process env (mirrors [`codex_hooks_path_in`]).
+fn prime_extension_path_in(
+    env_override: Option<std::ffi::OsString>,
+) -> anyhow::Result<std::path::PathBuf> {
+    if let Some(dir) = crate::commands::path_util::agent_config_home(env_override) {
+        return Ok(dir.join("extensions").join("ai-memory-prime-agent.ts"));
+    }
+    Ok(home_dir()
+        .context("could not locate $HOME for ~/.prime/agent/extensions")?
+        .join(".prime")
+        .join("agent")
+        .join("extensions")
+        .join("ai-memory-prime-agent.ts"))
+}
+
 /// `$KIMI_CODE_HOME/config.toml` when set, else `~/.kimi-code/config.toml`.
 /// Kimi Code keeps hooks as `[[hooks]]` entries inside the same
 /// config.toml that stores the user's providers/model, so the apply
@@ -348,13 +443,30 @@ pub fn run(config: &Config, mut args: InstallHooksArgs) -> Result<()> {
     let persisted = if args.apply
         && let Some(token) = auth_token_owned.as_deref()
     {
-        crate::config::store_hook_auth_token(&config.data_dir, token).with_context(|| {
-            format!(
-                "storing the hook auth token under {}",
-                config.data_dir.display()
-            )
-        })?;
-        true
+        // A failure here must NOT abort the whole install (#743-audit F5). The
+        // common case is a docker-wrapper run where `data_dir` is `/data`, a
+        // named volume the container user cannot write — and which the HOST
+        // hooks would not read from anyway (they look under the host's
+        // `~/.local/share/ai-memory`). Aborting left the operator with no hooks
+        // and no capture. Fall back to embedding the credential the pre-#552 way
+        // (into the rendered hook config/env) so the hooks still authenticate,
+        // and warn loudly about the reduced protection and how to get the secure
+        // path back.
+        match crate::config::store_hook_auth_token(&config.data_dir, token) {
+            Ok(()) => true,
+            Err(e) => {
+                eprintln!(
+                    "[ai-memory] warning: could not persist the hook auth token under {} ({e}); \
+                     embedding it in the rendered hook config instead so capture still works. \
+                     The token is then readable in that file / process argv. To keep it out \
+                     (recommended), install with a writable host data dir — e.g. \
+                     `AI_MEMORY_DATA_DIR=$HOME/.local/share/ai-memory` for the docker wrapper — \
+                     or a native `ai-memory` binary.",
+                    config.data_dir.display()
+                );
+                false
+            }
+        }
     } else {
         false
     };
@@ -383,6 +495,7 @@ pub fn run(config: &Config, mut args: InstallHooksArgs) -> Result<()> {
             | AgentChoice::OpenCode2
             | AgentChoice::Omp
             | AgentChoice::Pi
+            | AgentChoice::PrimeAgent
             | AgentChoice::Openclaw
     );
     if generated || local_hook_policy_v1_supported() {
@@ -414,6 +527,20 @@ pub fn run(config: &Config, mut args: InstallHooksArgs) -> Result<()> {
              agents may use their prompt hook to deliver handoff context, so removing it could \
              break cross-agent continuity."
         );
+    }
+    // Preserve an existing `--capture-assistant` opt-in on a bare re-apply. There
+    // is no negative flag, so a re-run without `--capture-assistant` (notably the
+    // `ai-memory run` auto-wire, which always passes it off) must NOT silently
+    // downgrade a user who had enabled assistant capture. An explicit
+    // `--capture-assistant` still forces it on; this only fills in the unset case
+    // from what is already installed. Gated to the agents where assistant capture
+    // is allowed (Claude Code, Codex), whose configs share the nested-hooks shape.
+    if args.apply
+        && !args.capture_assistant
+        && capture_assistant_allowed(args.agent)
+        && existing_capture_assistant_opt_in(&args)
+    {
+        args.capture_assistant = true;
     }
     if args.apply {
         // #446: settle the capture failure mode before any agent-specific
@@ -455,6 +582,9 @@ pub fn run(config: &Config, mut args: InstallHooksArgs) -> Result<()> {
                 apply_to_opencode2_plugin(&server_url, auth, &args, &capture_mode)
             }
             AgentChoice::Pi => apply_to_pi_extension(&server_url, auth, &args, &capture_mode),
+            AgentChoice::PrimeAgent => {
+                apply_to_prime_extension(&server_url, auth, &args, &capture_mode)
+            }
             AgentChoice::Omp => apply_to_omp_extension(&server_url, auth, &args, &capture_mode),
             AgentChoice::ClaudeCode => {
                 let hooks_dir =
@@ -559,6 +689,9 @@ pub fn run(config: &Config, mut args: InstallHooksArgs) -> Result<()> {
             render_opencode2_plugin(&server_url, auth, strategy, &preview_capture_mode)
         }
         AgentChoice::Pi => render_pi_extension(&server_url, auth, strategy, &preview_capture_mode),
+        AgentChoice::PrimeAgent => {
+            render_prime_extension(&server_url, auth, strategy, &preview_capture_mode)
+        }
         AgentChoice::Omp => render_omp_extension(
             &server_url,
             auth,
@@ -790,6 +923,54 @@ fn baked_claude_prompt_capture(existing: &str) -> Option<bool> {
     )
 }
 
+/// Whether the currently-installed config for this agent already bakes the
+/// `--capture-assistant` opt-in. Used to preserve that opt-in across a bare
+/// re-apply (e.g. `ai-memory run` auto-wire) instead of dropping it. Only the
+/// agents where assistant capture is allowed (Claude Code, Codex) reach here,
+/// and both write the nested-hooks JSON shape.
+fn existing_capture_assistant_opt_in(args: &InstallHooksArgs) -> bool {
+    existing_agent_config(args)
+        .as_deref()
+        .and_then(baked_capture_assistant)
+        .unwrap_or(false)
+}
+
+/// `Some(true|false)` when `existing` is a recognizable ai-memory install and
+/// whether its Stop command carries `--capture-assistant`; `None` when it is not
+/// an ai-memory install at all (so there is nothing to preserve).
+fn baked_capture_assistant(existing: &str) -> Option<bool> {
+    let document: serde_json::Value = serde_json::from_str(existing).ok()?;
+    let hooks = document.get("hooks")?.as_object()?;
+    let mut saw_ai_memory = false;
+    let mut has_marker = false;
+    for entries in hooks.values().filter_map(serde_json::Value::as_array) {
+        for entry in entries {
+            // Nested (`hooks:[{command}]`) or flat (`{command}`) shape.
+            let nested = entry.get("hooks").and_then(serde_json::Value::as_array);
+            let commands: Vec<&str> = match nested {
+                Some(inner) => inner
+                    .iter()
+                    .filter_map(|e| e.get("command").and_then(|c| c.as_str()))
+                    .collect(),
+                None => entry
+                    .get("command")
+                    .and_then(|c| c.as_str())
+                    .into_iter()
+                    .collect(),
+            };
+            for command in commands {
+                if hook_command_is_ours(command) {
+                    saw_ai_memory = true;
+                    if command.contains("--capture-assistant") {
+                        has_marker = true;
+                    }
+                }
+            }
+        }
+    }
+    saw_ai_memory.then_some(has_marker)
+}
+
 /// Read the config file `--apply` will update for the selected agent.
 fn existing_agent_config(args: &InstallHooksArgs) -> Option<String> {
     let path = if let Some(path) = &args.config_file {
@@ -808,6 +989,7 @@ fn existing_agent_config(args: &InstallHooksArgs) -> Option<String> {
             AgentChoice::OpenCode => opencode_plugin_path().ok()?,
             AgentChoice::OpenCode2 => opencode2_plugin_path().ok()?,
             AgentChoice::Pi => pi_extension_path().ok()?,
+            AgentChoice::PrimeAgent => prime_extension_path().ok()?,
             AgentChoice::Omp => omp_extension_path(args.profile.as_deref()).ok()?,
             AgentChoice::Openclaw => openclaw_plugin::default_plugin_dir()
                 .ok()?
@@ -836,12 +1018,14 @@ fn baked_project_strategy(agent: AgentChoice, existing: &str) -> Option<ProjectS
         AgentChoice::OpenCode
         | AgentChoice::OpenCode2
         | AgentChoice::Pi
+        | AgentChoice::PrimeAgent
         | AgentChoice::Omp
         | AgentChoice::Openclaw => {
             let marker = match agent {
                 AgentChoice::OpenCode => "--agent opencode --apply`.",
                 AgentChoice::OpenCode2 => "--agent opencode2 --apply`.",
                 AgentChoice::Pi => "--agent pi --apply`.",
+                AgentChoice::PrimeAgent => "--agent prime-agent --apply`.",
                 AgentChoice::Omp => "--agent omp --apply`.",
                 AgentChoice::Openclaw => "--agent openclaw --apply`.",
                 _ => return None,
@@ -1103,6 +1287,11 @@ fn infer_installed_mcp_config(agent: AgentChoice) -> Result<Option<InferredMcpCo
             "url",
         )),
         McpClient::Pi => Ok(None),
+        McpClient::PrimeAgent => Ok(infer_json_mcp_config(
+            &content,
+            &["mcpServers", "ai-memory"],
+            "url",
+        )),
         McpClient::AntigravityCli => Ok(infer_json_mcp_config(
             &content,
             &["mcpServers", "ai-memory"],
@@ -1139,6 +1328,14 @@ fn infer_installed_mcp_config(agent: AgentChoice) -> Result<Option<InferredMcpCo
             &["context_servers", "ai-memory"],
             "url",
         )),
+        // MCP-only client: no AgentChoice counterpart routes here. Muse
+        // Code's hook surface is documented, but its SessionStart output
+        // contract is not, so no lifecycle integration claims it yet.
+        McpClient::Muse => Ok(infer_json_mcp_config(
+            &content,
+            &["mcp_servers", "ai-memory"],
+            "url",
+        )),
     }
 }
 
@@ -1173,7 +1370,7 @@ fn find_grok_project_overlay(cwd: &Path, repo_root: Option<&Path>) -> Option<Pat
         .find(|path| path.exists())
 }
 
-fn mcp_client_for_agent(agent: AgentChoice) -> Option<McpClient> {
+pub(crate) fn mcp_client_for_agent(agent: AgentChoice) -> Option<McpClient> {
     match agent {
         AgentChoice::ClaudeCode => Some(McpClient::ClaudeCode),
         AgentChoice::Codex => Some(McpClient::Codex),
@@ -1192,6 +1389,11 @@ fn mcp_client_for_agent(agent: AgentChoice) -> Option<McpClient> {
         // Pi bridges MCP through its generated extension, not a native
         // mcp.json the installer can scrape.
         AgentChoice::Pi => None,
+        // Prime-agent keeps its MCP servers in the user-global settings.json
+        // `mcpServers` map, so an installed entry seeds the hooks
+        // install's server URL. Bearer auth stays flag-driven: the entry
+        // names an env var rather than embedding a literal token.
+        AgentChoice::PrimeAgent => Some(McpClient::PrimeAgent),
         AgentChoice::KiroCli | AgentChoice::KiroCliV3 => Some(McpClient::KiroCli),
         // No first-party Pool MCP installer ships yet, so there is no
         // config file to infer a server URL or token from.
@@ -1465,11 +1667,14 @@ fn overlay_kiro_cli_event_hooks(
 /// ai-memory cares about (`CLAUDE_CODE_EVENTS`); preserve every other hook the
 /// user has wired up to other tools.
 /// Whether `--capture-assistant` may take effect for this agent + platform
-/// (#196): Claude Code on a native hook platform only. Any other agent or a
-/// script-fallback platform cannot honor the opt-in, so the installer bails
-/// instead of enabling it silently.
+/// (#196, #743): Claude Code and Codex on a native hook platform. Both carry
+/// `last_assistant_message` on their `Stop` payload (see
+/// `ai_memory_hooks::assistant_capture`). Any other agent or a script-fallback
+/// platform cannot honor the opt-in, so the installer bails instead of enabling
+/// it silently.
 fn capture_assistant_allowed(agent: AgentChoice) -> bool {
-    matches!(agent, AgentChoice::ClaudeCode) && local_hook_policy_v1_supported()
+    matches!(agent, AgentChoice::ClaudeCode | AgentChoice::Codex)
+        && local_hook_policy_v1_supported()
 }
 
 fn prompt_capture_options_allowed(agent: AgentChoice) -> bool {
@@ -1801,6 +2006,8 @@ fn apply_to_command_code_settings_with_staged(
         "command-code",
         Some(data_dir),
         args.project_strategy.and_then(ProjectStrategyArg::baked),
+        // Command Code is refused by `capture_assistant_allowed`; never bake it.
+        false,
     );
     apply_to_command_code_settings_with_payload(payload, args)
 }
@@ -1874,7 +2081,10 @@ fn apply_to_codex_settings(
     data_dir: &Path,
     args: &InstallHooksArgs,
 ) -> Result<()> {
-    let staged = stage_hook_scripts(hooks_dir, "codex", data_dir)?;
+    let staged = super::codex_hook_generations::stage(
+        hooks_dir,
+        &hook_staging_root(data_dir, ai_memory_wiki::backup::running_in_container()),
+    )?;
     apply_to_codex_settings_with_staged(&staged, server_url, auth_token, data_dir, args)
 }
 
@@ -1887,7 +2097,7 @@ fn apply_to_codex_settings_in(
     staging_data_local: &Path,
     args: &InstallHooksArgs,
 ) -> Result<()> {
-    let staged = stage_hook_scripts_in(hooks_dir, "codex", staging_data_local)?;
+    let staged = super::codex_hook_generations::stage(hooks_dir, staging_data_local)?;
     let command_dir = staged_command_dir(&staged, "codex");
     let payload = crate::commands::render_shared::build_profile_script_payload_for_test(
         &super::render_shared::CODEX_PROFILE,
@@ -1917,6 +2127,10 @@ fn apply_to_codex_settings_with_staged(
         "codex",
         Some(data_dir),
         args.project_strategy.and_then(ProjectStrategyArg::baked),
+        // Codex Stop carries last_assistant_message (#743); bake the opt-in when
+        // asked. `capture_assistant_allowed` already gated it, so this only bakes
+        // on a native path.
+        args.capture_assistant,
     );
     apply_to_codex_settings_with_payload(payload, args)
 }
@@ -1962,6 +2176,7 @@ fn merge_codex_hooks(
     data_dir: &Path,
     project_strategy: Option<&str>,
     config_path: &Path,
+    capture_assistant: bool,
 ) -> Result<ApplyOutcome> {
     // Build the Codex-flavoured payload. The JSON shape is identical
     // to Claude Code's matcher + nested hooks form — the event list
@@ -1974,6 +2189,7 @@ fn merge_codex_hooks(
         "codex",
         Some(data_dir),
         project_strategy,
+        capture_assistant,
     );
     merge_codex_payload(payload, config_path)
 }
@@ -2050,7 +2266,58 @@ fn apply_to_cursor_settings(
             ApplyOutcome::NoOp => "already up to date",
         }
     );
+    warn_unrecognized_ai_memory_hooks(&path);
     Ok(())
+}
+
+/// Warn about hook entries that mention ai-memory but are not recognised as
+/// ours, e.g. a wrapper shim that injects `cwd` before calling the binary.
+/// `install-hooks` keeps those beside the native entries it adds, so every
+/// event would then be captured twice (#721). Best effort: never fails apply.
+fn warn_unrecognized_ai_memory_hooks(path: &Path) {
+    let Ok(raw) = fs::read_to_string(path) else {
+        return;
+    };
+    let Ok(root) = serde_json::from_str::<serde_json::Value>(&raw) else {
+        return;
+    };
+    for (event, command) in unrecognized_ai_memory_hook_entries(&root) {
+        eprintln!(
+            "# warning: {} `{event}` hook `{command}` mentions ai-memory but is not an \
+             ai-memory hook entry, so it was kept beside the native one and the event \
+             may be captured twice. Remove it if it wraps ai-memory.",
+            path.display()
+        );
+    }
+}
+
+fn unrecognized_ai_memory_hook_entries(root: &serde_json::Value) -> Vec<(String, String)> {
+    let Some(hooks) = root.get("hooks").and_then(serde_json::Value::as_object) else {
+        return Vec::new();
+    };
+    let mut found = Vec::new();
+    for (event, entries) in hooks {
+        let Some(entries) = entries.as_array() else {
+            continue;
+        };
+        for entry in entries.iter().filter(|e| !is_ai_memory_hook_entry(e)) {
+            let handlers = entry
+                .get("hooks")
+                .and_then(serde_json::Value::as_array)
+                .map_or_else(|| vec![entry], |inner| inner.iter().collect());
+            for handler in handlers {
+                let Some(command) = handler.get("command").and_then(serde_json::Value::as_str)
+                else {
+                    continue;
+                };
+                let lower = command.to_ascii_lowercase();
+                if lower.contains("ai-memory") || lower.contains("ai_memory") {
+                    found.push((event.clone(), command.to_string()));
+                }
+            }
+        }
+    }
+    found
 }
 
 fn merge_cursor_hooks(
@@ -2069,6 +2336,7 @@ fn merge_cursor_hooks(
         "cursor",
         Some(data_dir),
         project_strategy,
+        false,
     );
     let our_hooks = payload
         .get("hooks")
@@ -2161,6 +2429,7 @@ fn merge_gemini_hooks(
         "gemini-cli",
         Some(data_dir),
         project_strategy,
+        false,
     );
     let our_hooks = payload
         .get("hooks")
@@ -2968,9 +3237,16 @@ const AiMemoryOpencode2: Plugin = {
             ?? event?.location?.directory ?? directory;
           if (type === "session.created") {
             const id = data?.sessionID ?? data?.id ?? info?.id;
+            const parentID = info?.parentID ?? data?.parentID;
             startSession(id, data?.location?.directory ?? loc, {
               title: data?.title ?? info?.title,
               projectID: data?.projectID ?? info?.projectID,
+              // Subagent sessions carry a parentID; forward it as the `agent_id`
+              // marker so drop_subagent_captures works on OpenCode 2 too (#755).
+              // Root sessions have no parentID and must stay unmarked.
+              ...(typeof parentID === "string" && parentID
+                ? { agent_id: parentID }
+                : {}),
             });
           }
           if (type === "session.idle") {
@@ -3630,6 +3906,13 @@ export const AiMemoryHooks: Plugin = async ({{ directory }}) => {{
         startSession(id, cwd, {{
           title: info.title,
           projectID: info.projectID,
+          // A subagent session carries a parentID; forward it as the `agent_id`
+          // subagent marker so `drop_subagent_captures` can recognize (and drop)
+          // OpenCode subagent sessions too (#755). A root session has no
+          // parentID — never mark it, or every session looks like a subagent.
+          ...(typeof info.parentID === "string" && info.parentID
+            ? {{ agent_id: info.parentID }}
+            : {{}}),
         }});
       }}
       if (event?.type === "session.idle") {{
@@ -4011,7 +4294,8 @@ function mcpSignal(signal?: AbortSignal): AbortSignal | undefined {
 }
 
 async function mcpRpc(method: string, params?: unknown, ctx?: any, signal?: AbortSignal): Promise<any> {
-  const id = ++mcpRequestId;
+  const notification = method.startsWith("notifications/");
+  const id = notification ? undefined : ++mcpRequestId;
   const headers: Record<string, string> = {
     "Content-Type": "application/json",
     "Accept": "application/json, text/event-stream",
@@ -4029,6 +4313,7 @@ async function mcpRpc(method: string, params?: unknown, ctx?: any, signal?: Abor
     signal: mcpSignal(signal),
   });
   if (!response.ok) throw new Error(`ai-memory MCP ${method} failed: HTTP ${response.status}`);
+  if (notification) return;
   const payload = await response.json();
   if (payload?.error) throw new Error(`ai-memory MCP ${method} failed: ${payload.error.message ?? JSON.stringify(payload.error)}`);
   if (payload?.result?.isError) throw new Error(`ai-memory MCP ${method} returned isError`);
@@ -4071,11 +4356,282 @@ async function bootstrapMcpBridge(pi: any): Promise<void> {
 "#
 }
 
+fn prime_extension_hint_in(env_override: Option<std::ffi::OsString>) -> String {
+    prime_extension_path_in(env_override).map_or_else(
+        |_| "~/.prime/agent/extensions/ai-memory-prime-agent.ts".to_string(),
+        |p| p.display().to_string(),
+    )
+}
+
+fn apply_to_prime_extension(
+    server_url: &str,
+    auth_token: Option<&str>,
+    args: &InstallHooksArgs,
+    capture_mode: &str,
+) -> Result<()> {
+    let path = resolve_prime_extension_path(args)?;
+    let strategy = args.project_strategy.and_then(ProjectStrategyArg::baked);
+    let body = build_prime_agent_extension(server_url, auth_token, strategy, capture_mode);
+
+    let outcome = apply_atomic(&path, move |_existing| Ok(body.clone()))?;
+    println!(
+        "✓ {} {} ({})",
+        outcome.verb(),
+        path.display(),
+        match outcome {
+            ApplyOutcome::Created => "new prime-agent extension file",
+            ApplyOutcome::Updated => "backup written next to it",
+            ApplyOutcome::NoOp => "already up to date",
+        }
+    );
+
+    // No warn_if_agents_share_extensions_dir call: prime-agent resolves under
+    // PRIME_AGENT_CODING_AGENT_DIR / ~/.prime/agent, a directory neither Pi
+    // nor OMP ever writes to, so the shared-directory double-capture the
+    // Pi/OMP warning guards against cannot happen here.
+    remove_legacy_extension(&path, "prime-agent");
+
+    if !matches!(outcome, ApplyOutcome::NoOp) {
+        println!();
+        println!(
+            "prime-agent loads TypeScript extensions from ~/.prime/agent/extensions/ on next start."
+        );
+        println!("Restart prime-agent for lifecycle capture and MCP tools to take effect.");
+    }
+    Ok(())
+}
+
+fn render_prime_extension(
+    server_url: &str,
+    auth_token: Option<&str>,
+    project_strategy: Option<&str>,
+    capture_mode: &str,
+) -> Result<()> {
+    println!(
+        "// prime-agent extension — write to {}",
+        prime_extension_hint_in(std::env::var_os("PRIME_AGENT_CODING_AGENT_DIR"))
+    );
+    println!("// Or re-run with `--apply` to install it automatically.");
+    println!(
+        "// Restart prime-agent after changing extensions; MCP tools are bridged by this file."
+    );
+    println!("// A project-local `.prime/agent/extensions/` copy is prime-agent's own opt-in;");
+    println!("// pass it via `--config-file` to target that location instead.");
+    println!();
+    println!(
+        "{}",
+        build_prime_agent_extension(server_url, auth_token, project_strategy, capture_mode)
+    );
+    Ok(())
+}
+
+fn resolve_prime_extension_path(args: &InstallHooksArgs) -> Result<PathBuf> {
+    if let Some(p) = &args.config_file {
+        return Ok(p.clone());
+    }
+    prime_extension_path()
+}
+
+/// prime-agent lifecycle + MCP bridge extension.
+///
+/// Port of [`build_pi_extension`]: prime-agent inherits Pi's extension host
+/// (`pi.on(...)`, `pi.registerTool`, `ctx.sessionManager`), so the shared
+/// capture prelude (marker walk, capture-policy v1, bounded queue + spool,
+/// runtime token resolution, MCP bridge) is reused verbatim with the agent
+/// constant swapped. Event mapping: `session_start` → `session-start`,
+/// `before_agent_start` → handoff fetch, `tool_call` → `pre-tool-use`,
+/// `tool_result` → `post-tool-use`, `session_shutdown` → `session-end`,
+/// `session_before_compact`/`session_compact` → `pre-compact`.
+///
+/// prime-agent's supported `refine_complete` event has no canonical memory
+/// hook event, so it rides the tolerant extension channel
+/// (`?event=other&extension=prime-agent&source_event=<name>`) pending a canonical
+/// enum decision.
+fn build_prime_agent_extension(
+    server_url: &str,
+    auth_token: Option<&str>,
+    project_strategy: Option<&str>,
+    capture_mode: &str,
+) -> String {
+    let lifecycle = build_omp_extension_with_extra_handlers(
+        server_url,
+        auth_token,
+        project_strategy,
+        capture_mode,
+        PRIME_REFINEMENT_HANDLER,
+    )
+        .replace(
+            "install-hooks --agent omp --apply",
+            "install-hooks --agent prime-agent --apply",
+        )
+        .replace("const AGENT = \"omp\";", "const AGENT = \"prime-agent\";")
+        .replace(
+            r#"
+  api.on("session.compacting", (_event: any, ctx: any) => {
+    postPreCompact(ctx);
+  });
+"#,
+            "\n",
+        )
+        .replace(
+            "export default function AiMemoryExtension(api: any): void {",
+            &format!(
+                "{}\nexport default function AiMemoryExtension(pi: any): void {{\n  try {{ void bootstrapMcpBridge(pi); }} catch (_e) {{}}",
+                prime_mcp_bridge_source()
+            ),
+        )
+        .replace("api.on(\"", "pi.on(\"")
+        .replace(
+            "async function fetchHandoff(",
+            &format!("{PRIME_EXTENSION_HOOK_SOURCE}\n\nasync function fetchHandoff("),
+        );
+    debug_assert!(!lifecycle.contains(".omp"));
+    debug_assert!(!lifecycle.contains("const AGENT = \"pi\";"));
+    debug_assert!(!lifecycle.contains("ai-memory-pi-"));
+    lifecycle
+}
+
+const PRIME_REFINEMENT_HANDLER: &str = r#"
+
+  // Prime emits refine_complete after applying and persisting a refinement.
+  // There is no pre-refine event in its extension API. Completion rides the
+  // tolerant extension channel until memory has a canonical hook event.
+  api.on("refine_complete", (_event: any, ctx: any) => {
+    startSession(ctx);
+    postExtensionHook("refine_complete", sessionPayload(ctx));
+  });"#;
+
+/// `postExtensionHook`: the tolerant extension channel for prime-agent
+/// events with no canonical hook-event name (currently the refinement
+/// lifecycle). Posts to `?event=other&extension=prime-agent&source_event=<name>`,
+/// which the server ingests without a dedicated enum variant.
+const PRIME_EXTENSION_HOOK_SOURCE: &str = r#"function postExtensionHook(sourceEvent: string, payload: Record<string, unknown>): void {
+  const url = new URL(`${SERVER}/hook`);
+  url.searchParams.set("event", "other");
+  url.searchParams.set("agent", AGENT);
+  url.searchParams.set("extension", AGENT);
+  url.searchParams.set("source_event", sourceEvent);
+  applyMarkerParams(url, typeof payload.cwd === "string" ? payload.cwd : undefined);
+  const policy = capturePolicy(payload, typeof payload.cwd === "string" ? payload.cwd : undefined);
+  if (policy.disposition === "drop") return;
+  try {
+    enqueueHook("other", url, policy.payload);
+  } catch (_e) {
+    // Best-effort capture. Hooks must never block the agent.
+  }
+}"#;
+
+fn prime_mcp_bridge_source() -> &'static str {
+    r#"
+// ---- MCP bridge ------------------------------------------------------------
+const MCP_SERVER = deriveMcpServer(SERVER);
+const MCP_REQUEST_TIMEOUT_MS = 10000;
+let mcpRequestId = 0;
+
+function deriveMcpServer(server: string): string {
+  const trimmed = server.replace(/\/+$/, "");
+  return trimmed.endsWith("/mcp") ? trimmed : `${trimmed}/mcp`;
+}
+
+function mcpSessionId(ctx: any): string | undefined {
+  const id = sessionID(ctx) ?? ctx?.sessionId ?? ctx?.sessionID ?? ctx?.session?.id;
+  return typeof id === "string" && id.length > 0 ? id : undefined;
+}
+
+function mcpSignal(signal?: AbortSignal): AbortSignal | undefined {
+  const timeout = timeoutSignal(MCP_REQUEST_TIMEOUT_MS);
+  if (!signal) return timeout;
+  if (!timeout) return signal;
+  const anyFactory = (AbortSignal as unknown as { any?: (signals: AbortSignal[]) => AbortSignal }).any;
+  return anyFactory ? anyFactory([signal, timeout]) : timeout;
+}
+
+async function mcpRpc(method: string, params?: unknown, ctx?: any, signal?: AbortSignal): Promise<any> {
+  const notification = method.startsWith("notifications/");
+  const id = notification ? undefined : ++mcpRequestId;
+  const headers: Record<string, string> = {
+    "Content-Type": "application/json",
+    "Accept": "application/json, text/event-stream",
+    ...authHeaders(),
+  };
+  const session = mcpSessionId(ctx);
+  if (session) {
+    headers["X-Memory-Actor-Session-Id"] = session;
+    headers["Mcp-Session-Id"] = session;
+  }
+  const response = await fetch(MCP_SERVER, {
+    method: "POST",
+    headers,
+    body: JSON.stringify({ jsonrpc: "2.0", id, method, params: params ?? {} }),
+    signal: mcpSignal(signal),
+  });
+  if (!response.ok) throw new Error(`ai-memory MCP ${method} failed: HTTP ${response.status}`);
+  if (notification) return;
+  const payload = await response.json();
+  if (payload?.error) throw new Error(`ai-memory MCP ${method} failed: ${payload.error.message ?? JSON.stringify(payload.error)}`);
+  if (payload?.result?.isError) throw new Error(`ai-memory MCP ${method} returned isError`);
+  return payload?.result;
+}
+
+function toolInputSchema(tool: any): any {
+  return tool?.inputSchema ?? { type: "object", additionalProperties: true };
+}
+
+async function bootstrapMcpBridge(pi: any): Promise<void> {
+  try {
+    await mcpRpc("initialize", {
+      protocolVersion: "2025-03-26",
+      capabilities: {},
+      clientInfo: { name: "ai-memory-prime-agent-extension", version: "0.0.0" },
+    });
+    try { await mcpRpc("notifications/initialized"); } catch (_e) {}
+    const listed = await mcpRpc("tools/list");
+    for (const tool of listed?.tools ?? []) {
+      try {
+        pi.registerTool({
+          name: tool.name,
+          label: tool.name,
+          description: tool.description,
+          parameters: toolInputSchema(tool),
+          execute: async (_toolCallId: string, params: unknown, signal?: AbortSignal, _onUpdate?: unknown, ctx?: any) => {
+            const result = await mcpRpc("tools/call", { name: tool.name, arguments: params ?? {} }, ctx, signal);
+            return { content: result?.content ?? [], details: result };
+          },
+        });
+      } catch (_e) {
+        // Duplicate registration or tool-shape mismatch must not break lifecycle capture.
+      }
+    }
+  } catch (_e) {
+    // MCP bridge is best-effort; extension load and lifecycle capture must survive.
+  }
+}
+"#
+}
+
 fn build_omp_extension(
     server_url: &str,
     auth_token: Option<&str>,
     project_strategy: Option<&str>,
     capture_mode: &str,
+) -> String {
+    build_omp_extension_with_extra_handlers(
+        server_url,
+        auth_token,
+        project_strategy,
+        capture_mode,
+        "",
+    )
+}
+
+// Adapter-specific registrations have an explicit slot in the shared factory,
+// independent of changes to the shutdown handler or its bounded queue drain.
+fn build_omp_extension_with_extra_handlers(
+    server_url: &str,
+    auth_token: Option<&str>,
+    project_strategy: Option<&str>,
+    capture_mode: &str,
+    extra_handlers: &str,
 ) -> String {
     let token_line = auth_token
         .map(|t| format!("const TOKEN: string | null = {};\n", ts_string_literal(t)))
@@ -4428,7 +4984,7 @@ export default function AiMemoryExtension(api: any): void {{
     startSession(ctx);
     postHook("session-end", sessionPayload(ctx));
     await drainHookQueueForDispose();
-  }});
+  }});{extra_handlers}
 }}
 "#,
         server_literal = ts_string_literal(server_url),
@@ -4701,6 +5257,12 @@ fn copy_support_hook_scripts(source_dir: &Path, dest_root: &Path) -> Result<()> 
         return Ok(());
     };
     let dest_lib = dest_hooks_root.join("lib");
+    if dest_lib.is_symlink() {
+        anyhow::bail!(
+            "refusing to stage hook support scripts through symlink {}",
+            dest_lib.display()
+        );
+    }
     fs::create_dir_all(&dest_lib)
         .with_context(|| format!("creating hook support dir {}", dest_lib.display()))?;
     for entry in fs::read_dir(&source_lib)
@@ -4712,15 +5274,37 @@ fn copy_support_hook_scripts(source_dir: &Path, dest_root: &Path) -> Result<()> 
             continue;
         }
         let to = dest_lib.join(from.file_name().context("bad support file name")?);
-        fs::copy(&from, &to)
-            .with_context(|| format!("copying {} → {}", from.display(), to.display()))?;
+        // These are managed bundle assets, not user configuration symlinks.
+        // Never follow a destination link or copy immutable source permissions
+        // onto the staged file: a later install must be able to replace it.
+        if to.is_symlink() {
+            anyhow::bail!(
+                "refusing to stage hook support script through symlink {}",
+                to.display()
+            );
+        }
+        let bytes = fs::read(&from).with_context(|| format!("reading {}", from.display()))?;
+        match fs::read(&to) {
+            Ok(existing) if existing == bytes => continue,
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(error).with_context(|| format!("reading {}", to.display()));
+            }
+        }
+        ai_memory_wiki::write_atomic(&to, &bytes)
+            .with_context(|| format!("staging {} → {}", from.display(), to.display()))?;
     }
     Ok(())
 }
 
 fn staged_command_dir(staged: &Path, agent_label: &str) -> PathBuf {
     match std::env::var("AI_MEMORY_HOOKS_HOST_ROOT") {
-        Ok(root) if !root.trim().is_empty() => PathBuf::from(root).join(agent_label),
+        Ok(root) if !root.trim().is_empty() => PathBuf::from(root).join(
+            super::codex_hook_generations::command_suffix(staged)
+                .filter(|_| agent_label == "codex")
+                .unwrap_or_else(|| PathBuf::from(agent_label)),
+        ),
         _ => staged.to_path_buf(),
     }
 }
@@ -4743,7 +5327,11 @@ fn resolve_hooks_dir(
     if let Some(p) = explicit {
         let path = p.join(sub);
         if path.is_dir() {
-            return Ok(path);
+            return if sub == "codex" {
+                super::codex_hook_generations::source(&path, true)
+            } else {
+                Ok(path)
+            };
         }
         anyhow::bail!("hooks directory {} does not exist", path.display());
     }
@@ -4757,7 +5345,11 @@ fn resolve_hooks_dir(
     );
     for path in &candidates {
         if !path.as_os_str().is_empty() && path.is_dir() {
-            return Ok(path.clone());
+            return if sub == "codex" {
+                super::codex_hook_generations::source(path, false)
+            } else {
+                Ok(path.clone())
+            };
         }
     }
     anyhow::bail!(
@@ -5754,12 +6346,11 @@ mod tests {
     use tempfile::TempDir;
 
     #[test]
-    fn capture_assistant_allowed_only_for_claude_native() {
+    fn capture_assistant_allowed_only_for_claude_and_codex_native() {
         use crate::cli::AgentChoice::*;
-        // Every non-Claude agent is rejected regardless of platform (#196): the
-        // opt-in cannot take effect for them, so the installer must bail.
+        // Every agent that cannot honor the opt-in is rejected regardless of
+        // platform (#196): the installer must bail rather than enable it silently.
         for agent in [
-            Codex,
             CommandCode,
             Cursor,
             GeminiCli,
@@ -5782,9 +6373,14 @@ mod tests {
                 "{agent:?} must not allow --capture-assistant"
             );
         }
-        // Claude Code tracks the native-platform gate exactly.
+        // Claude Code and Codex (#743) both carry last_assistant_message on Stop
+        // and track the native-platform gate exactly.
         assert_eq!(
             capture_assistant_allowed(ClaudeCode),
+            local_hook_policy_v1_supported()
+        );
+        assert_eq!(
+            capture_assistant_allowed(Codex),
             local_hook_policy_v1_supported()
         );
     }
@@ -6244,6 +6840,7 @@ command = "AI_MEMORY_HOOK_URL=http://h AI_MEMORY_PROJECT_STRATEGY=repo-root /x/a
             (AgentChoice::OpenCode, "opencode"),
             (AgentChoice::OpenCode2, "opencode2"),
             (AgentChoice::Pi, "pi"),
+            (AgentChoice::PrimeAgent, "prime-agent"),
             (AgentChoice::Omp, "omp"),
             (AgentChoice::Openclaw, "openclaw"),
         ] {
@@ -7180,6 +7777,40 @@ command = "AI_MEMORY_HOOK_URL=http://h AI_MEMORY_PROJECT_STRATEGY=repo-root /x/a
         assert_eq!(inferred.auth_token.as_deref(), Some("secret-token"));
     }
 
+    /// Prime-agent seeds the hooks install from its user-global settings.json
+    /// entry: the `url` yields the hook origin, while auth stays flag-driven —
+    /// the entry names `bearerTokenEnvVar` rather than embedding a literal
+    /// header, so there is no token to infer (the generated extension
+    /// resolves `AI_MEMORY_AUTH_TOKEN` at runtime instead).
+    #[test]
+    fn prime_agent_mcp_inference_supplies_hook_origin_without_token() {
+        assert_eq!(
+            mcp_client_for_agent(AgentChoice::PrimeAgent),
+            Some(McpClient::PrimeAgent)
+        );
+        let inferred = infer_json_mcp_config(
+            r#"{
+              "mcpServers": {
+                "ai-memory": {
+                  "type": "http",
+                  "url": "http://homelab:49374/mcp",
+                  "bearerTokenEnvVar": "AI_MEMORY_AUTH_TOKEN",
+                  "enabledTools": ["memory_query", "memory_read_page"]
+                }
+              }
+            }"#,
+            &["mcpServers", "ai-memory"],
+            "url",
+        )
+        .unwrap();
+
+        assert_eq!(
+            inferred.hook_server_url.as_deref(),
+            Some("http://homelab:49374")
+        );
+        assert!(inferred.auth_token.is_none());
+    }
+
     #[test]
     fn hook_server_url_from_mcp_url_strips_query_and_suffix() {
         for (input, expected) in [
@@ -7545,6 +8176,198 @@ model = "gpt-5"
         );
     }
 
+    #[test]
+    fn copy_support_hook_scripts_reinstalls_and_updates_support_bundles() {
+        let tmp = TempDir::new().unwrap();
+        let first = tmp.path().join("bundle-v1/cursor");
+        let next = tmp.path().join("bundle-v2/cursor");
+        for (source, content) in [(&first, "# first\n"), (&next, "# second\n")] {
+            fs::create_dir_all(source).unwrap();
+            let lib = source.parent().unwrap().join("lib");
+            fs::create_dir(&lib).unwrap();
+            fs::write(lib.join("shared.ps1"), content).unwrap();
+        }
+        let dest = tmp.path().join("data/hooks/cursor");
+        let support_dir = dest.parent().unwrap().join("lib");
+        fs::create_dir_all(&support_dir).unwrap();
+        let unrelated = support_dir.join("third-party.ps1");
+        fs::write(&unrelated, b"# keep this helper\n").unwrap();
+
+        for (source, expected) in [
+            (&first, "# first\n"),
+            (&first, "# first\n"),
+            (&next, "# second\n"),
+        ] {
+            copy_support_hook_scripts(source, &dest).unwrap();
+            assert_eq!(
+                fs::read_to_string(support_dir.join("shared.ps1")).unwrap(),
+                expected
+            );
+            assert_eq!(fs::read(&unrelated).unwrap(), b"# keep this helper\n");
+            assert_eq!(fs::read_dir(&support_dir).unwrap().count(), 2);
+        }
+        for (source, expected) in [(&first, "# first\n"), (&next, "# second\n")] {
+            assert_eq!(
+                fs::read_to_string(source.parent().unwrap().join("lib/shared.ps1")).unwrap(),
+                expected
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    fn readonly_support_bundle(root: &Path, content: &[u8]) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+
+        let agent = root.join("cursor");
+        fs::create_dir_all(&agent).unwrap();
+        fs::create_dir_all(root.join("lib")).unwrap();
+        stub_scripts(&agent, &["session-start.sh"]);
+        let support = root.join("lib/shared.ps1");
+        fs::write(&support, content).unwrap();
+        for path in [support, agent.join("session-start.sh")] {
+            fs::set_permissions(path, fs::Permissions::from_mode(0o444)).unwrap();
+        }
+        agent
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stage_hook_scripts_reinstalls_and_updates_readonly_support_bundles() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+        let tmp = TempDir::new().unwrap();
+        let first = readonly_support_bundle(&tmp.path().join("bundle-v1"), b"# first\n");
+        let next = readonly_support_bundle(&tmp.path().join("bundle-v2"), b"# second\n");
+        let data = tmp.path().join("data");
+        let support_dir = data.join("hooks/lib");
+        fs::create_dir_all(&support_dir).unwrap();
+        let unrelated = support_dir.join("third-party.ps1");
+        fs::write(&unrelated, b"# keep this helper\n").unwrap();
+        let target = support_dir.join("shared.ps1");
+
+        stage_hook_scripts_in(&first, "cursor", &data).unwrap();
+        assert_eq!(fs::read(&target).unwrap(), b"# first\n");
+        assert!(
+            !fs::metadata(&target).unwrap().permissions().readonly(),
+            "staged helpers must not inherit immutable source permissions"
+        );
+        let original_inode = fs::metadata(&target).unwrap().ino();
+        stage_hook_scripts_in(&first, "cursor", &data).unwrap();
+        assert_eq!(fs::read(&target).unwrap(), b"# first\n");
+        assert_eq!(
+            fs::metadata(&target).unwrap().ino(),
+            original_inode,
+            "identical support files must not be rewritten"
+        );
+        stage_hook_scripts_in(&next, "cursor", &data).unwrap();
+        assert_eq!(fs::read(&target).unwrap(), b"# second\n");
+        assert_ne!(fs::metadata(&target).unwrap().ino(), original_inode);
+        assert_eq!(fs::read(&unrelated).unwrap(), b"# keep this helper\n");
+        for (source, expected) in [(&first, b"# first\n".as_slice()), (&next, b"# second\n")] {
+            let support = source.parent().unwrap().join("lib/shared.ps1");
+            assert_eq!(fs::read(&support).unwrap(), expected);
+            assert_eq!(
+                fs::metadata(&support).unwrap().permissions().mode() & 0o777,
+                0o444
+            );
+        }
+        assert_eq!(fs::read_dir(&support_dir).unwrap().count(), 2);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn copy_support_hook_scripts_replaces_readonly_destination_without_mutating_old_inode() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+        let tmp = TempDir::new().unwrap();
+        let source = readonly_support_bundle(&tmp.path().join("bundle"), b"# update\n");
+        let dest = tmp.path().join("data/hooks/cursor");
+        let support_dir = dest.parent().unwrap().join("lib");
+        fs::create_dir_all(&support_dir).unwrap();
+        let target = support_dir.join("shared.ps1");
+        fs::write(&target, b"# prior install\n").unwrap();
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o444)).unwrap();
+        let outside = tmp.path().join("old-inode.ps1");
+        fs::hard_link(&target, &outside).unwrap();
+
+        copy_support_hook_scripts(&source, &dest).unwrap();
+
+        assert_eq!(fs::read(&target).unwrap(), b"# update\n");
+        assert_eq!(fs::read(&outside).unwrap(), b"# prior install\n");
+        assert_eq!(
+            fs::metadata(&outside).unwrap().permissions().mode() & 0o777,
+            0o444
+        );
+        assert_ne!(
+            fs::metadata(&target).unwrap().ino(),
+            fs::metadata(&outside).unwrap().ino()
+        );
+        assert!(!fs::metadata(&target).unwrap().permissions().readonly());
+        assert_eq!(fs::read_dir(&support_dir).unwrap().count(), 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn copy_support_hook_scripts_rejects_existing_and_dangling_destination_symlinks() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = TempDir::new().unwrap();
+        let source = readonly_support_bundle(&tmp.path().join("bundle"), b"# managed\n");
+        for exists in [true, false] {
+            let root = tmp
+                .path()
+                .join(if exists { "existing" } else { "dangling" });
+            let support_dir = root.join("hooks/lib");
+            fs::create_dir_all(&support_dir).unwrap();
+            let outside = root.join("outside.ps1");
+            if exists {
+                fs::write(&outside, b"# unrelated\n").unwrap();
+            }
+            let target = support_dir.join("shared.ps1");
+            symlink(&outside, &target).unwrap();
+
+            let error = copy_support_hook_scripts(&source, &root.join("hooks/cursor")).unwrap_err();
+
+            assert!(error.to_string().contains("symlink"), "{error:#}");
+            assert_eq!(fs::read_link(&target).unwrap(), outside);
+            if exists {
+                assert_eq!(fs::read(&outside).unwrap(), b"# unrelated\n");
+            } else {
+                assert!(
+                    !outside.exists(),
+                    "staging must not create a symlink target"
+                );
+            }
+            assert_eq!(fs::read_dir(&support_dir).unwrap().count(), 1);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn copy_support_hook_scripts_rejects_symlinked_support_directory() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = TempDir::new().unwrap();
+        let source = readonly_support_bundle(&tmp.path().join("bundle"), b"# managed\n");
+        let dest = tmp.path().join("data/hooks/cursor");
+        fs::create_dir_all(dest.parent().unwrap()).unwrap();
+        let outside = tmp.path().join("outside");
+        fs::create_dir(&outside).unwrap();
+        fs::write(outside.join("shared.ps1"), b"# unrelated\n").unwrap();
+        let target = dest.parent().unwrap().join("lib");
+        symlink(&outside, &target).unwrap();
+
+        let error = copy_support_hook_scripts(&source, &dest).unwrap_err();
+
+        assert!(error.to_string().contains("symlink"), "{error:#}");
+        assert_eq!(fs::read_link(&target).unwrap(), outside);
+        assert_eq!(
+            fs::read(outside.join("shared.ps1")).unwrap(),
+            b"# unrelated\n"
+        );
+        assert_eq!(fs::read_dir(&outside).unwrap().count(), 1);
+    }
+
     /// Skipping `_lib.sh` is fine — older source bundles without the
     /// marker-walk-up feature should still install cleanly.
     #[test]
@@ -7755,6 +8578,133 @@ model = "gpt-5"
         );
     }
 
+    /// F5 (docker-wrapper audit), the regression guard: when the bearer
+    /// *cannot* be persisted under the data dir, `--apply` must still install
+    /// working hooks by embedding the credential inline instead of aborting the
+    /// whole install with no hooks at all.
+    ///
+    /// The real case is the docker wrapper: `data_dir` is `/data`, a container
+    /// volume the host hooks never read from and that the container user often
+    /// cannot write. Before this fix a persist failure hard-aborted, leaving the
+    /// operator with neither the secure path nor any capture at all.
+    #[test]
+    fn apply_falls_back_to_inline_bearer_when_persisting_fails() {
+        let home = TempDir::new().unwrap();
+        let cfg_dir = TempDir::new().unwrap();
+        let settings = cfg_dir.path().join("settings.json");
+        std::fs::write(&settings, "{}").unwrap();
+
+        let config = crate::config::Config::load(None, Some(home.path().to_path_buf())).unwrap();
+
+        // Make ONLY the secret write fail — like a data dir the installer cannot
+        // write the token into — while leaving hook staging (which writes under
+        // `<data_dir>/hooks/`) fully working: pre-create the `<data_dir>/auth-token`
+        // path as a *directory*, so `write_secret`'s file open returns EISDIR.
+        std::fs::create_dir_all(crate::config::hook_auth_token_path_in(&config.data_dir)).unwrap();
+
+        let args = InstallHooksArgs {
+            agent: AgentChoice::ClaudeCode,
+            apply: true,
+            server_url: Some("http://127.0.0.1:49374".to_string()),
+            auth_token: Some("FALLBACK-BEARER-F5".to_string()),
+            config_file: Some(settings.clone()),
+            hooks_dir: Some(
+                std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../hooks"),
+            ),
+            ..default_hook_args()
+        };
+
+        // The whole point of the fix: a persist failure must not abort the install.
+        run(&config, args).expect("apply must not abort when the bearer cannot be persisted");
+
+        let rendered = std::fs::read_to_string(&settings).unwrap();
+        assert!(
+            rendered.contains("FALLBACK-BEARER-F5"),
+            "the bearer must be embedded inline so the hooks still authenticate: {rendered}"
+        );
+
+        // It genuinely took the fallback, not the secure path: nothing persisted.
+        assert_eq!(
+            crate::config::read_hook_auth_token(&config.data_dir),
+            None,
+            "the token must not have been persisted in the failure case"
+        );
+    }
+
+    fn claude_apply_args(
+        settings: &std::path::Path,
+        hooks_dir: &std::path::Path,
+        capture_assistant: bool,
+    ) -> InstallHooksArgs {
+        InstallHooksArgs {
+            agent: AgentChoice::ClaudeCode,
+            apply: true,
+            capture_assistant,
+            server_url: Some("http://127.0.0.1:49374".to_string()),
+            config_file: Some(settings.to_path_buf()),
+            hooks_dir: Some(hooks_dir.to_path_buf()),
+            ..default_hook_args()
+        }
+    }
+
+    /// Regression for the auto-wire capture-downgrade (post-audit S1): a bare
+    /// `--apply` without `--capture-assistant` — exactly what `ai-memory run`
+    /// auto-wire issues — must PRESERVE a user's existing assistant-capture
+    /// opt-in, not silently strip it.
+    ///
+    /// Unix-gated: `--capture-assistant` is baked onto the native Stop command on
+    /// POSIX-native platforms; the Windows Claude command form does not carry the
+    /// flag in its rendered JSON, so there is nothing to drop or preserve there.
+    /// The preserve logic itself (`baked_capture_assistant`) has no platform
+    /// branch.
+    #[cfg(unix)]
+    #[test]
+    fn a_bare_reapply_preserves_an_existing_capture_assistant_opt_in() {
+        let home = TempDir::new().unwrap();
+        let cfg_dir = TempDir::new().unwrap();
+        let settings = cfg_dir.path().join("settings.json");
+        std::fs::write(&settings, "{}").unwrap();
+        let config = crate::config::Config::load(None, Some(home.path().to_path_buf())).unwrap();
+        let hooks_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../hooks");
+
+        run(&config, claude_apply_args(&settings, &hooks_dir, true)).expect("first install");
+        assert!(
+            std::fs::read_to_string(&settings)
+                .unwrap()
+                .contains("--capture-assistant"),
+            "the explicit opt-in must be baked on the first install"
+        );
+
+        // A bare re-apply (the auto-wire shape: capture_assistant = false).
+        run(&config, claude_apply_args(&settings, &hooks_dir, false)).expect("bare re-apply");
+        assert!(
+            std::fs::read_to_string(&settings)
+                .unwrap()
+                .contains("--capture-assistant"),
+            "a bare re-apply must preserve the existing --capture-assistant opt-in"
+        );
+    }
+
+    /// The preserve logic must not false-positive: a fresh install without the
+    /// flag stays off.
+    #[test]
+    fn a_fresh_install_without_the_flag_leaves_assistant_capture_off() {
+        let home = TempDir::new().unwrap();
+        let cfg_dir = TempDir::new().unwrap();
+        let settings = cfg_dir.path().join("settings.json");
+        std::fs::write(&settings, "{}").unwrap();
+        let config = crate::config::Config::load(None, Some(home.path().to_path_buf())).unwrap();
+        let hooks_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../hooks");
+
+        run(&config, claude_apply_args(&settings, &hooks_dir, false)).expect("fresh install");
+        assert!(
+            !std::fs::read_to_string(&settings)
+                .unwrap()
+                .contains("--capture-assistant"),
+            "a fresh install without the flag must not enable assistant capture"
+        );
+    }
+
     #[test]
     fn hook_source_candidates_include_native_package_dir() {
         let candidates = hook_source_candidates(
@@ -7898,6 +8848,15 @@ model = "gpt-5"
                 "pi",
                 build_pi_extension("http://127.0.0.1:49374", Some("tok"), None, "denylist"),
             ),
+            (
+                "prime-agent",
+                build_prime_agent_extension(
+                    "http://127.0.0.1:49374",
+                    Some("tok"),
+                    None,
+                    "denylist",
+                ),
+            ),
         ] {
             // The fire-and-forget delivery must be gone...
             assert!(
@@ -8001,6 +8960,11 @@ model = "gpt-5"
         assert!(!plugin.contains("handoffChecked"));
         assert!(plugin.contains("function startSession"));
         assert!(plugin.contains("function endSession"));
+        // #755: a subagent session must forward its parentID as the `agent_id`
+        // marker (so drop_subagent_captures recognizes it), and only when the
+        // parentID is a real string (a root session stays unmarked).
+        assert!(plugin.contains("agent_id: info.parentID"));
+        assert!(plugin.contains("typeof info.parentID === \"string\""));
         assert!(plugin.contains("fetchHandoff"));
         assert!(plugin.contains("function applyMarkerParams"));
         assert!(plugin.contains("readFileSync(marker, \"utf8\")"));
@@ -8092,6 +9056,11 @@ model = "gpt-5"
         assert!(!plugin.contains("Plugin.define({"));
         assert!(plugin.contains("const AiMemoryOpencode2: Plugin = {"));
         assert!(plugin.contains("export default AiMemoryOpencode2;"));
+        // #755: subagent sessions forward parentID as the `agent_id` marker,
+        // only when it is a real string (root sessions stay unmarked).
+        assert!(plugin.contains("const parentID = info?.parentID ?? data?.parentID"));
+        assert!(plugin.contains("agent_id: parentID"));
+        assert!(plugin.contains("typeof parentID === \"string\""));
         // Beta hooks, verified against `@opencode-ai/plugin@beta`.
         assert!(plugin.contains("ctx.event.subscribe"));
         assert!(plugin.contains("ctx.session.hook(\"prompt\""));
@@ -8815,6 +9784,8 @@ model = "gpt-5"
         assert!(extension.contains("anyFactory([signal, timeout])"));
         assert!(extension.contains("mcpRpc(\"initialize\""));
         assert!(extension.contains("mcpRpc(\"notifications/initialized\""));
+        assert!(extension.contains("const id = notification ? undefined : ++mcpRequestId;"));
+        assert!(extension.contains("if (notification) return;"));
         assert!(extension.contains("mcpRpc(\"tools/list\""));
         assert!(extension.contains("pi.registerTool"));
         assert!(extension.contains("label: tool.name"));
@@ -8848,6 +9819,253 @@ model = "gpt-5"
         );
     }
 
+    #[test]
+    fn prime_extension_path_honours_prime_agent_coding_agent_dir() {
+        let custom = if cfg!(windows) {
+            r"C:\custom\prime-agent"
+        } else {
+            "/custom/prime-agent"
+        };
+        let path = prime_extension_path_in(Some(std::ffi::OsString::from(custom))).unwrap();
+        assert_eq!(
+            path,
+            Path::new(custom)
+                .join("extensions")
+                .join("ai-memory-prime-agent.ts")
+        );
+
+        // Unset and blank both fall back to ~/.prime/agent/extensions/ai-memory-prime-agent.ts.
+        // Blank counts as unset because an exported-but-empty variable is nearly
+        // always a failed shell expansion, not a request to install into the
+        // filesystem root.
+        for env in [None, Some(std::ffi::OsString::new())] {
+            let path = prime_extension_path_in(env).unwrap();
+            assert!(
+                path.ends_with(
+                    Path::new(".prime")
+                        .join("agent")
+                        .join("extensions")
+                        .join("ai-memory-prime-agent.ts")
+                ),
+                "default must be ~/.prime/agent/extensions/ai-memory-prime-agent.ts, got {}",
+                path.display()
+            );
+        }
+    }
+
+    #[test]
+    fn prime_extension_hint_follows_prime_agent_coding_agent_dir() {
+        let custom = if cfg!(windows) {
+            r"C:\custom\prime-agent"
+        } else {
+            "/custom/prime-agent"
+        };
+        let hint = prime_extension_hint_in(Some(std::ffi::OsString::from(custom)));
+        assert!(
+            hint.contains("custom") && hint.ends_with("ai-memory-prime-agent.ts"),
+            "hint must point at the relocated agent home, got: {hint}"
+        );
+        assert!(
+            !hint.contains(".prime/agent"),
+            "hint must not advertise the default home when the var is set: {hint}"
+        );
+
+        let hint = prime_extension_hint_in(None);
+        let tail: PathBuf = [".prime", "agent", "extensions", "ai-memory-prime-agent.ts"]
+            .iter()
+            .collect();
+        assert!(
+            hint.ends_with(&tail.display().to_string()),
+            "unset must keep the documented default, got: {hint}"
+        );
+    }
+
+    #[test]
+    fn prime_extension_is_directly_discoverable_by_prime_agent() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp
+            .path()
+            .join("extensions")
+            .join("ai-memory-prime-agent.ts");
+        let args = InstallHooksArgs {
+            agent: AgentChoice::PrimeAgent,
+            capture_assistant: false,
+            no_capture_prompts: false,
+            capture_mode: None,
+            capture_prompts: false,
+            hooks_dir: None,
+            server_url: Some("http://127.0.0.1:49374".into()),
+            auth_token: None,
+            as_user: None,
+            apply: true,
+            config_file: Some(path.clone()),
+            project_strategy: Some(ProjectStrategyArg::Basename),
+            profile: None,
+        };
+
+        let resolved = resolve_prime_extension_path(&args).unwrap();
+
+        assert_eq!(resolved, path);
+        assert_eq!(
+            resolved.file_name().and_then(|s| s.to_str()),
+            Some("ai-memory-prime-agent.ts")
+        );
+        assert_eq!(
+            resolved
+                .parent()
+                .and_then(|p| p.file_name())
+                .and_then(|s| s.to_str()),
+            Some("extensions")
+        );
+    }
+
+    #[test]
+    fn prime_extension_bakes_allowlist_admit_gate() {
+        let extension =
+            build_prime_agent_extension("http://127.0.0.1:49374", Some("tok"), None, "allowlist");
+        assert!(
+            extension.contains("const CAPTURE_MODE: \"allowlist\" | \"denylist\" = \"allowlist\";"),
+            "{extension}"
+        );
+        assert!(extension.contains(CAPTURE_ADMIT_GATE_TS), "{extension}");
+    }
+
+    #[test]
+    fn prime_extension_denylist_bakes_inert_gate() {
+        let extension =
+            build_prime_agent_extension("http://127.0.0.1:49374", Some("tok"), None, "denylist");
+        assert!(
+            extension.contains("const CAPTURE_MODE: \"allowlist\" | \"denylist\" = \"denylist\";"),
+            "{extension}"
+        );
+        assert!(extension.contains(CAPTURE_ADMIT_GATE_TS), "{extension}");
+    }
+
+    #[test]
+    fn prime_extension_uses_bounded_hook_queue() {
+        let extension =
+            build_prime_agent_extension("http://127.0.0.1:49374", Some("tok"), None, "denylist");
+
+        assert_generated_ts_uses_bounded_hook_queue(&extension);
+    }
+
+    #[test]
+    fn prime_extension_keeps_refinement_capture_with_async_shutdown_drain() {
+        let extension =
+            build_prime_agent_extension("http://127.0.0.1:49374", Some("tok"), None, "denylist");
+
+        assert!(extension.contains("const HOOK_DISPOSE_DRAIN_BUDGET_MS = 2000;"));
+        assert!(
+            extension.contains("await Promise.race([requestHookDrain(), disposeDrainTimeout()]);")
+        );
+        assert!(extension.contains(
+            r#"pi.on("session_shutdown", async (_event: any, ctx: any) => {
+    startSession(ctx);
+    postHook("session-end", sessionPayload(ctx));
+    await drainHookQueueForDispose();
+  });"#
+        ));
+        assert!(extension.contains(&PRIME_REFINEMENT_HANDLER.replace("api.on(", "pi.on(")));
+        assert_eq!(extension.matches("pi.on(\"refine_complete\"").count(), 1);
+        assert!(!extension.contains("session_before_refine"));
+
+        for extension in [
+            build_omp_extension("http://127.0.0.1:49374", None, None, "denylist"),
+            build_pi_extension("http://127.0.0.1:49374", None, None, "denylist"),
+        ] {
+            assert!(!extension.contains("refine_complete"));
+        }
+    }
+
+    #[test]
+    fn prime_extension_resolves_token_at_runtime_when_not_embedded() {
+        let extension =
+            build_prime_agent_extension("http://127.0.0.1:49374", None, None, "denylist");
+        assert!(extension.contains("function resolveToken("));
+        assert!(extension.contains("process.env.AI_MEMORY_AUTH_TOKEN"));
+        assert!(extension.contains("auth-token"));
+        assert!(extension.contains("if (!response.ok) return undefined;"));
+    }
+
+    #[test]
+    fn prime_extension_contains_lifecycle_capture_and_mcp_bridge() {
+        let extension = build_prime_agent_extension(
+            "http://127.0.0.1:49374/base",
+            Some("tok"),
+            None,
+            "denylist",
+        );
+
+        assert!(extension.contains("export default function AiMemoryExtension(pi: any): void"));
+        assert!(extension.contains("const AGENT = \"prime-agent\";"));
+        assert!(extension.contains("install-hooks --agent prime-agent --apply"));
+        assert!(extension.contains("pi.on(\"session_start\""));
+        assert!(extension.contains("pi.on(\"before_agent_start\""));
+        assert!(extension.contains("pi.on(\"tool_call\""));
+        assert!(extension.contains("pi.on(\"tool_result\""));
+        assert!(extension.contains("pi.on(\"session_before_compact\""));
+        assert!(extension.contains("pi.on(\"session_compact\""));
+        assert!(!extension.contains("pi.on(\"session.compacting\""));
+        assert!(extension.contains("pi.on(\"agent_end\""));
+        assert!(extension.contains("pi.on(\"session_shutdown\""));
+        assert!(extension.contains("postHook(\"session-start\""));
+        assert!(extension.contains("postHook(\"user-prompt\""));
+        assert!(extension.contains("postHook(\"pre-tool-use\""));
+        assert!(extension.contains("postHook(\"post-tool-use\""));
+        assert!(extension.contains("postHook(\"pre-compact\""));
+        assert!(extension.contains("postHook(\"stop\""));
+        assert!(extension.contains("postHook(\"session-end\""));
+        // Supported refinement completion rides the tolerant extension channel
+        // pending a canonical enum decision.
+        assert!(!extension.contains("session_before_refine"));
+        assert!(extension.contains("pi.on(\"refine_complete\""));
+        assert!(extension.contains("function postExtensionHook("));
+        assert!(extension.contains("url.searchParams.set(\"event\", \"other\");"));
+        assert!(extension.contains("url.searchParams.set(\"extension\", AGENT);"));
+        assert!(extension.contains("url.searchParams.set(\"source_event\", sourceEvent);"));
+        assert!(extension.contains("postExtensionHook(\"refine_complete\""));
+        assert!(extension.contains("fetchHandoff"));
+        assert!(extension.contains("customType: \"ai-memory-handoff\""));
+        assert!(extension.contains("const MCP_SERVER = deriveMcpServer(SERVER);"));
+        assert!(extension.contains("clientInfo: { name: \"ai-memory-prime-agent-extension\""));
+        assert!(
+            extension.contains("return trimmed.endsWith(\"/mcp\") ? trimmed : `${trimmed}/mcp`;")
+        );
+        assert!(extension.contains("\"Accept\": \"application/json, text/event-stream\""));
+        assert!(extension.contains("...authHeaders()"));
+        assert!(extension.contains("headers[\"X-Memory-Actor-Session-Id\"] = session;"));
+        assert!(extension.contains("headers[\"Mcp-Session-Id\"] = session;"));
+        assert!(extension.contains("function mcpSignal(signal?: AbortSignal)"));
+        assert!(extension.contains("anyFactory([signal, timeout])"));
+        assert!(extension.contains("mcpRpc(\"initialize\""));
+        assert!(extension.contains("mcpRpc(\"notifications/initialized\""));
+        assert!(extension.contains("const id = notification ? undefined : ++mcpRequestId;"));
+        assert!(extension.contains("if (notification) return;"));
+        assert!(extension.contains("mcpRpc(\"tools/list\""));
+        assert!(extension.contains("pi.registerTool"));
+        assert!(extension.contains("label: tool.name"));
+        assert!(extension.contains("parameters: toolInputSchema(tool)"));
+        assert!(extension.contains(
+            "mcpRpc(\"tools/call\", { name: tool.name, arguments: params ?? {} }, ctx, signal)"
+        ));
+        assert!(extension.contains("payload?.error"));
+        assert!(extension.contains("payload?.result?.isError"));
+        assert!(extension.contains("response.ok"));
+        assert!(extension.contains("signal: mcpSignal(signal)"));
+        assert!(extension.contains("Bearer ${token}"));
+        assert!(extension.contains("tok"));
+        assert!(extension.contains("import { execFileSync } from \"node:child_process\";"));
+        assert!(extension.contains("function findMarker("));
+        assert!(extension.contains("function resolveToken("));
+        assert!(extension.contains("function spoolFailedHook("));
+        assert!(extension.contains("async function drainHookSpool()"));
+        assert!(!extension.contains(".omp"));
+        assert!(!extension.contains("const AGENT = \"pi\";"));
+        assert!(!extension.contains("ai-memory-pi-"));
+        assert!(!extension.contains("serve --transport stdio"));
+        assert!(!extension.contains("serve --stdio"));
+    }
+
     // Windows 11 + Git Bash support matters for regulated enterprise setups
     // where Git Bash is the approved shell available from the corporate
     // repository, so this installer contract should be exercised anywhere
@@ -8864,7 +10082,15 @@ model = "gpt-5"
             return;
         };
 
-        for alias in ["opencode", "openclaw", "omp", "oh-my-pi", "pi"] {
+        for alias in [
+            "opencode",
+            "openclaw",
+            "omp",
+            "oh-my-pi",
+            "pi",
+            "prime",
+            "prime-agent",
+        ] {
             let output = Command::new(&bash)
                 .arg(&script)
                 .arg("--agent")
@@ -8894,6 +10120,12 @@ model = "gpt-5"
                     assert!(stdout.contains("~/.pi/agent/extensions/ai-memory.ts"));
                     assert!(stdout.contains("MCP tools come through the same generated bridge"));
                     assert!(!stdout.contains("~/.omp/agent/extensions/ai-memory.ts"));
+                }
+                "prime" | "prime-agent" => {
+                    assert!(stdout.contains("install-hooks --agent prime-agent --apply"));
+                    assert!(stdout.contains("~/.prime/agent/extensions/ai-memory-prime-agent.ts"));
+                    assert!(stdout.contains("MCP tools come through the same generated bridge"));
+                    assert!(!stdout.contains("~/.pi/agent/extensions/ai-memory.ts"));
                 }
                 _ => unreachable!(),
             }
@@ -8955,6 +10187,81 @@ model = "gpt-5"
         assert_eq!(
             parsed["version"], 1,
             "version: 1 must be set at the top level"
+        );
+    }
+
+    #[test]
+    fn cursor_native_hooks_detection_requires_an_ai_memory_cursor_entry() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("hooks.json");
+        assert!(!cursor_native_hooks_installed_in(&path), "missing file");
+
+        fs::write(&path, "not json").unwrap();
+        assert!(!cursor_native_hooks_installed_in(&path), "malformed file");
+
+        fs::write(
+            &path,
+            r#"{"version":1,"hooks":{"sessionStart":[
+                {"command":"/opt/third-party","args":["--agent","cursor"]},
+                {"command":"/usr/bin/ai-memory","args":["hook","--event","session-start","--agent","claude-code","--server-url","http://h"]}
+            ]}}"#,
+        )
+        .unwrap();
+        assert!(
+            !cursor_native_hooks_installed_in(&path),
+            "third-party or non-cursor entries do not count"
+        );
+
+        fs::write(
+            &path,
+            r#"{"version":1,"hooks":{"stop":[
+                {"command":"/usr/bin/ai-memory","args":["hook","--event","stop","--agent","cursor","--server-url","http://h"]}
+            ]}}"#,
+        )
+        .unwrap();
+        assert!(cursor_native_hooks_installed_in(&path), "exec form");
+
+        fs::write(
+            &path,
+            r#"{"version":1,"hooks":{"stop":[
+                {"command":"/usr/bin/ai-memory hook --event stop --agent cursor --server-url http://h"}
+            ]}}"#,
+        )
+        .unwrap();
+        assert!(
+            cursor_native_hooks_installed_in(&path),
+            "command-string form"
+        );
+    }
+
+    #[test]
+    fn unrecognized_ai_memory_hook_entries_flags_wrappers_only() {
+        let root = serde_json::json!({
+            "version": 1,
+            "hooks": {
+                "sessionStart": [
+                    {"command": "/usr/bin/ai-memory", "args": ["hook", "--event", "session-start", "--agent", "cursor", "--server-url", "http://h"]},
+                    {"command": "~/bin/ai-memory-cwd-shim.sh session-start"},
+                    {"command": "/opt/other-tool --flag"}
+                ],
+                "stop": [
+                    {"matcher": "", "hooks": [{"command": "/home/u/.local/ai_memory_wrap stop"}]}
+                ]
+            }
+        });
+        let found = unrecognized_ai_memory_hook_entries(&root);
+        assert_eq!(
+            found,
+            vec![
+                (
+                    "sessionStart".to_string(),
+                    "~/bin/ai-memory-cwd-shim.sh session-start".to_string()
+                ),
+                (
+                    "stop".to_string(),
+                    "/home/u/.local/ai_memory_wrap stop".to_string()
+                ),
+            ]
         );
     }
 
@@ -9036,6 +10343,7 @@ model = "gpt-5"
             config_tmp.path(),
             None,
             &config_path,
+            false,
         )
         .unwrap();
 
@@ -9051,6 +10359,65 @@ model = "gpt-5"
         assert!(
             parsed["hooks"]["SessionEnd"].is_array(),
             "SessionEnd is wired for Codex since Codex CLI 0.145.0"
+        );
+    }
+
+    /// #743: with `--capture-assistant`, the Codex Stop command carries the
+    /// `--capture-assistant` flag (and only Stop does); without it, no command
+    /// does. Mirrors the native-command bake asserted for Claude Code.
+    #[test]
+    fn codex_bakes_capture_assistant_flag_on_stop_only_when_opted_in() {
+        fn stop_and_start_commands(capture: bool) -> (String, String) {
+            let hooks_tmp = TempDir::new().unwrap();
+            stub_scripts(
+                hooks_tmp.path(),
+                &[
+                    "session-start.sh",
+                    "user-prompt-submit.sh",
+                    "pre-tool-use.sh",
+                    "post-tool-use.sh",
+                    "pre-compact.sh",
+                    "stop.sh",
+                    "session-end.sh",
+                ],
+            );
+            let config_tmp = TempDir::new().unwrap();
+            let config_path = config_tmp.path().join("hooks.json");
+            merge_codex_hooks(
+                hooks_tmp.path(),
+                "http://127.0.0.1:49374",
+                None,
+                config_tmp.path(),
+                None,
+                &config_path,
+                capture,
+            )
+            .unwrap();
+            let parsed: serde_json::Value =
+                serde_json::from_str(&fs::read_to_string(&config_path).unwrap()).unwrap();
+            let cmd = |event: &str| {
+                parsed["hooks"][event][0]["hooks"][0]["command"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_string()
+            };
+            (cmd("Stop"), cmd("SessionStart"))
+        }
+
+        let (stop_on, start_on) = stop_and_start_commands(true);
+        assert!(
+            stop_on.contains("--capture-assistant"),
+            "opted-in Codex Stop must bake --capture-assistant: {stop_on}"
+        );
+        assert!(
+            !start_on.contains("--capture-assistant"),
+            "only Stop carries the flag, not SessionStart: {start_on}"
+        );
+
+        let (stop_off, _) = stop_and_start_commands(false);
+        assert!(
+            !stop_off.contains("--capture-assistant"),
+            "without the opt-in no command carries the flag: {stop_off}"
         );
     }
 
@@ -9086,6 +10453,7 @@ model = "gpt-5"
             config_tmp.path(),
             None,
             &config_path,
+            false,
         )
         .unwrap();
 
@@ -9110,8 +10478,8 @@ model = "gpt-5"
     /// The test-only Codex wrapper must stage scripts under its injected
     /// data-local root and wire that stable path into the generated config.
     #[test]
-    fn codex_apply_stages_into_injected_dir() {
-        let hooks_tmp = TempDir::new().unwrap();
+    fn codex_apply_stages_into_injected_dir() -> Result<()> {
+        let hooks_tmp = TempDir::new()?;
         stub_scripts(
             hooks_tmp.path(),
             &[
@@ -9124,9 +10492,25 @@ model = "gpt-5"
             ],
         );
 
-        let config_tmp = TempDir::new().unwrap();
+        let config_tmp = TempDir::new()?;
         let config_path = config_tmp.path().join("hooks.json");
-        let staging_tmp = TempDir::new().unwrap();
+        let staging_tmp = TempDir::new()?;
+
+        let args = InstallHooksArgs {
+            profile: None,
+            agent: AgentChoice::Codex,
+            capture_assistant: false,
+            no_capture_prompts: false,
+            capture_mode: None,
+            capture_prompts: false,
+            hooks_dir: Some(hooks_tmp.path().to_path_buf()),
+            server_url: Some("http://127.0.0.1:49374".to_string()),
+            auth_token: None,
+            config_file: Some(config_path.clone()),
+            project_strategy: Some(ProjectStrategyArg::Basename),
+            as_user: None,
+            apply: false,
+        };
 
         apply_to_codex_settings_in(
             hooks_tmp.path(),
@@ -9134,46 +10518,44 @@ model = "gpt-5"
             None,
             config_tmp.path(),
             staging_tmp.path(),
-            &InstallHooksArgs {
-                profile: None,
-                agent: AgentChoice::Codex,
-                capture_assistant: false,
-                no_capture_prompts: false,
-                capture_mode: None,
-                capture_prompts: false,
-                hooks_dir: Some(hooks_tmp.path().to_path_buf()),
-                server_url: Some("http://127.0.0.1:49374".to_string()),
-                auth_token: None,
-                config_file: Some(config_path.clone()),
-                project_strategy: Some(ProjectStrategyArg::Basename),
-                as_user: None,
-                apply: false,
-            },
-        )
-        .unwrap();
+            &args,
+        )?;
 
-        let staged_script = staging_tmp
-            .path()
-            .join("hooks")
-            .join("codex")
-            .join("session-start.sh");
+        let staged_script = super::super::codex_hook_generations::source(
+            &staging_tmp.path().join("hooks/codex"),
+            false,
+        )?
+        .join("session-start.sh");
         assert!(
             staged_script.is_file(),
             "expected hook script staged at {}, override was not honoured",
             staged_script.display()
         );
 
-        let parsed: serde_json::Value =
-            serde_json::from_str(&fs::read_to_string(&config_path).unwrap()).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&fs::read_to_string(&config_path)?)?;
         let command = parsed
             .pointer("/hooks/SessionStart/0/hooks/0/command")
             .and_then(serde_json::Value::as_str)
-            .expect("SessionStart command should be present");
+            .context("SessionStart command should be present")?;
         assert!(
             command.contains(&staged_script.to_string_lossy().into_owned()),
             "generated command must reference staged script {}: {command}",
             staged_script.display()
         );
+        let before = fs::read(&config_path)?;
+        let modified = fs::metadata(&config_path)?.modified()?;
+        apply_to_codex_settings_in(
+            hooks_tmp.path(),
+            "http://127.0.0.1:49374",
+            None,
+            config_tmp.path(),
+            staging_tmp.path(),
+            &args,
+        )?;
+        assert_eq!(fs::read(&config_path)?, before);
+        assert_eq!(fs::metadata(&config_path)?.modified()?, modified);
+        assert_eq!(fs::read_dir(config_tmp.path())?.count(), 1);
+        Ok(())
     }
 
     // ----------------------------------------------------------------

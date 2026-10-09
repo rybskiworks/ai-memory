@@ -89,6 +89,20 @@ purge needs. Rebuilding only the indexes a given caller "should" have touched
 is what leaves a managed agent's transcript text in the file after an operator
 asked for it to be reclaimed.
 
+Session purges hold the wiki mutation guard across the database deletion and
+file cleanup. In-flight page writes and watcher reindexes finish before the
+purge starts; new ones wait until cleanup completes. This also serializes the
+purge with wiki project/session moves. Admission webhooks run before this guard.
+File cleanup failures still leave the database purge committed and are reported
+in `files_failed`; this coordination does not provide crash-atomic rollback.
+
+The guard is taken before the purge is submitted to the writer actor, so it also
+covers the wait for whatever that single queue is already draining, and — with
+`compact: true` — the `VACUUM` that runs after the delete commits. A purge on a
+busy server therefore holds up wiki mutations for longer than the delete itself.
+The git checkpoints taken before and after the purge sit outside the guard: they
+bracket it, they do not snapshot it.
+
 ### Scope containment
 
 The session id is never authority on its own. Every statement is filtered on
@@ -652,6 +666,24 @@ What it does not recover:
 - Sessions, observations, handoffs, users, audit rows, access counters, and
   embeddings. Those live only in SQLite and require a full `backup` / `restore`
   if you need to roll them back.
+
+### Upgrading the Prime-enabled fork to upstream 2.4
+
+The fork previously assigned V61 to `sessions_prime_agent_kind`, while upstream
+assigned V61 to `page_abstract_embeddings`. This build recognizes the exact
+released Prime migration checksum, creates the missing upstream table, and
+updates its upstream history row in one transaction. Prime schema changes are
+then recorded independently in `refinery_fork_schema_history`; upstream retains
+its original migration numbers. Fresh databases and upstream databases also gain
+the Prime session constraint. An unrecognized legacy checksum is rejected.
+
+Before deploying a new pin, take and verify a native backup, then test opening a
+disposable restored copy with the new binary. Confirm existing Prime sessions,
+observations, scoped retrieval, and new hook capture before updating the service
+and its clients together. Keep the prior image and the backup: reverting the
+binary alone cannot downgrade the upgraded upstream schema. Restore the prior
+backup with the server stopped when rolling back. Wiki Git history alone does
+not include the database, sessions, observations, or embeddings.
 
 ### `backup`
 
