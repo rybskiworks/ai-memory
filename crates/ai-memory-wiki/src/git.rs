@@ -1153,36 +1153,44 @@ mod tests {
     }
 
     #[test]
-    fn concurrent_appends_do_not_fail_a_commit() {
+    fn concurrent_appends_do_not_fail_a_commit() -> Result<(), Box<dyn std::error::Error>> {
         let (_tmp, root, adapter) = committed(&[("ws/proj/log.md", "")]);
         let ledger = root.join("ws/proj/log.md");
-        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        // Finite writers guarantee completion even when the platform's mutex
+        // repeatedly favors an appender over the committing thread.
+        let ready = Arc::new(std::sync::Barrier::new(4));
         let writers: Vec<_> = (0..3)
             .map(|_| {
                 let adapter = adapter.clone();
                 let ledger = ledger.clone();
-                let stop = Arc::clone(&stop);
-                std::thread::spawn(move || {
-                    while !stop.load(std::sync::atomic::Ordering::Relaxed) {
-                        adapter
-                            .append(&ledger, b"2026-09-08T00:00:00Z stop x\n")
-                            .unwrap();
+                let ready = Arc::clone(&ready);
+                std::thread::spawn(move || -> std::io::Result<()> {
+                    ready.wait();
+                    for _ in 0..100 {
+                        adapter.append(&ledger, b"2026-09-08T00:00:00Z stop x\n")?;
                     }
+                    Ok(())
                 })
             })
             .collect();
+        ready.wait();
         for i in 0..30 {
             std::thread::sleep(Duration::from_millis(2));
             adapter.mark_written(&ledger);
-            adapter
-                .commit_all(&format!("session {i}"))
-                .unwrap_or_else(|e| panic!("commit {i} failed: {e}"));
+            adapter.commit_all(&format!("session {i}"))?;
         }
-        stop.store(true, std::sync::atomic::Ordering::Relaxed);
         for w in writers {
-            w.join().unwrap();
+            w.join()
+                .map_err(|_| std::io::Error::other("append thread panicked"))??;
         }
+        adapter.commit_all("final concurrent append checkpoint")?;
+        let repo = Repository::open(&root)?;
+        let tree = repo.head()?.peel_to_tree()?;
+        let entry = tree.get_path(Path::new("ws/proj/log.md"))?;
+        let blob = repo.find_blob(entry.id())?;
+        assert_eq!(std::str::from_utf8(blob.content())?.lines().count(), 300);
         assert!(adapter.commit_count() >= 2);
+        Ok(())
     }
 
     /// Not a test: run by hand with `--ignored --nocapture`.
