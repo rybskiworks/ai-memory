@@ -15,11 +15,9 @@
 #
 # Usage: check-changelog-frozen.sh [base-ref]   (default: origin/main)
 #
-# Compares the merge base of <base-ref> and HEAD against HEAD, and rejects
-# any changed CHANGELOG line that sits below the `## [Unreleased]` heading.
-# Deliberate historical corrections on the default branch are unaffected:
-# this asks what a branch changes relative to where it forked, not what the
-# file looks like versus a tag.
+# Compares existing released prose on <base-ref> with HEAD. Newer releases and
+# the trailing Markdown reference links may advance without rewriting older
+# release entries.
 
 set -euo pipefail
 
@@ -45,7 +43,29 @@ git rev-parse --verify "$BASE_REF" >/dev/null 2>&1 || {
 # a rewrite), so only sections present in both are compared.
 
 released_half() {
-    git show "$1:CHANGELOG.md" 2>/dev/null | awk '/^## \[[0-9]/{f=1} f'
+    git show "$1:CHANGELOG.md" 2>/dev/null | awk '
+        /^## \[[0-9]/ { released = 1 }
+        released {
+            # Reference links at EOF describe the whole changelog. In particular,
+            # the Unreleased comparison advances whenever a new release lands.
+            # Buffer a possible footer; flush it if more prose follows so an
+            # embedded definition cannot hide edits to historical entries.
+            if ($0 ~ /^\[[^]]+\]:[[:space:]]+[^[:space:]]/) {
+                pending = pending $0 ORS
+                references = 1
+                next
+            }
+            if ($0 ~ /^[[:space:]]*$/) {
+                pending = pending $0 ORS
+                next
+            }
+            printf "%s", pending
+            pending = ""
+            references = 0
+            print
+        }
+        END { if (!references) printf "%s", pending }
+    '
 }
 
 BASE_RELEASED="$(released_half "$BASE_REF")"

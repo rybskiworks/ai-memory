@@ -66,6 +66,7 @@ pub fn run(config: &Config, args: SetupAgentArgs) -> Result<()> {
         AgentChoice::OpenCode
             | AgentChoice::OpenCode2
             | AgentChoice::Pi
+            | AgentChoice::PrimeAgent
             | AgentChoice::Omp
             | AgentChoice::Openclaw
     ) {
@@ -171,6 +172,7 @@ pub fn run(config: &Config, args: SetupAgentArgs) -> Result<()> {
         AgentChoice::OpenCode
         | AgentChoice::OpenCode2
         | AgentChoice::Pi
+        | AgentChoice::PrimeAgent
         | AgentChoice::Omp
         | AgentChoice::Openclaw
         | AgentChoice::Zero
@@ -273,6 +275,12 @@ fn emit_extension_setup_hint(args: &SetupAgentArgs) -> Result<()> {
             "Then restart Pi so it loads ~/.pi/agent/extensions/ai-memory.ts.",
             "pi",
         ),
+        AgentChoice::PrimeAgent => (
+            "prime-agent",
+            "prime-agent",
+            "Then restart prime-agent so it loads ~/.prime/agent/extensions/ai-memory-prime-agent.ts.",
+            "prime-agent",
+        ),
         AgentChoice::Openclaw => (
             "OpenClaw",
             "openclaw",
@@ -301,7 +309,7 @@ fn emit_extension_setup_hint(args: &SetupAgentArgs) -> Result<()> {
     println!("{restart_note}");
     if matches!(args.agent, AgentChoice::Pi) {
         println!(
-            "MCP tools come through the same generated Pi bridge extension; no native mcp.json is written."
+            "MCP tools come through the same generated bridge extension; no native mcp.json is written."
         );
     } else {
         println!("Also run `ai-memory install-mcp --client {mcp_client}` to wire MCP separately.");
@@ -604,6 +612,23 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         let args = SetupAgentArgs {
             agent: AgentChoice::Pi,
+            to: tmp.path().join("hooks"),
+            host_prefix: None,
+            server_url: "http://127.0.0.1:49374".into(),
+            auth_token: None,
+            source: Some(tmp.path().join("source")),
+        };
+
+        run(&Config::default(), args).unwrap();
+
+        assert!(!tmp.path().join("hooks").exists());
+    }
+
+    #[test]
+    fn prime_setup_prints_extension_hint_without_copying() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let args = SetupAgentArgs {
+            agent: AgentChoice::PrimeAgent,
             to: tmp.path().join("hooks"),
             host_prefix: None,
             server_url: "http://127.0.0.1:49374".into(),

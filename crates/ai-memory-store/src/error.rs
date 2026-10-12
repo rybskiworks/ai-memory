@@ -19,6 +19,10 @@ pub enum StoreError {
     #[error("migration: {0}")]
     Migration(#[from] refinery::Error),
 
+    /// A historical fork migration does not match the released definition.
+    #[error("unrecognized Prime migration history; restore a verified backup before upgrading")]
+    ForkMigrationMismatch,
+
     /// The store's schema is newer than this binary: an applied migration is
     /// absent from the compiled-in set (refinery reports this as
     /// `MissingVersion`). The data was written by a newer ai-memory build than
@@ -117,6 +121,24 @@ pub enum StoreError {
     /// in use by another workspace (`workspaces.name` is UNIQUE).
     #[error("workspace name '{0}' is already taken")]
     WorkspaceNameTaken(String),
+
+    /// A page create was refused because another live page in the same scope
+    /// differs from it only by case or Unicode normalization. Such a pair is
+    /// one file on macOS and Windows, so creating the second destroys the
+    /// first (#1/#2: the index kept both rows and served the survivor's body
+    /// for either path).
+    #[error(
+        "page path '{requested}' collides with existing page '{existing}': they differ only in \
+         case or Unicode normalization, so a case-insensitive or normalizing filesystem (macOS, \
+         Windows) stores both at one file and this write would destroy the other page. Choose a \
+         distinct path, or delete/rename the existing page first."
+    )]
+    PagePathCollides {
+        /// The path this write asked for.
+        requested: String,
+        /// The live page it would land on.
+        existing: String,
+    },
 
     /// A session move was rejected because the destination scope already has
     /// a latest page at the session page path (`idx_pages_latest_path`), so

@@ -949,9 +949,14 @@ pub(crate) fn build_profile_payload(
         "claude-code",
         None,
         None,
+        false,
     )
 }
 
+// A hook-render builder that threads several independent render inputs (profile,
+// paths, agent, scope strategy, capture opt-in); grouping them into a struct
+// would not make the one call path clearer than the named parameters do.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn build_profile_payload_for_agent(
     profile: &HookProfile,
     emit_root: &Path,
@@ -960,6 +965,7 @@ pub(crate) fn build_profile_payload_for_agent(
     agent: &str,
     data_dir: Option<&Path>,
     project_strategy: Option<&str>,
+    capture_assistant: bool,
 ) -> serde_json::Value {
     build_hook_payload(
         profile.events,
@@ -972,7 +978,8 @@ pub(crate) fn build_profile_payload_for_agent(
             agent,
             data_dir,
             project_strategy,
-        ),
+        )
+        .with_capture_assistant(capture_assistant),
     )
 }
 
@@ -1767,6 +1774,33 @@ fn powershell_call_operator(agent: &str) -> &'static str {
 
 fn win_double_quote(s: &str) -> String {
     format!("\"{}\"", s.replace('"', ""))
+}
+
+/// Match only a generated native command prefix for this exact executable.
+/// Keep ownership checks on the same quoting rules as the command renderer;
+/// an executable path appearing in an argument does not establish ownership.
+pub(crate) fn native_hook_command_uses_exe(command: &str, exe: &Path) -> bool {
+    let exe = exe.to_string_lossy();
+    if exe.is_empty() {
+        return false;
+    }
+    // Only accept this host's native quoting. Windows double quotes or a bare
+    // space-containing path have different shell semantics on POSIX hosts.
+    let prefixes = if cfg!(windows) {
+        let windows = win_double_quote(&exe);
+        vec![
+            windows.clone(),
+            format!("{}{windows}", powershell_call_operator("codex")),
+            exe.into_owned(),
+        ]
+    } else {
+        vec![shell_quote(&exe)]
+    };
+    prefixes.iter().any(|prefix| {
+        command.strip_prefix(prefix).is_some_and(|rest| {
+            rest.starts_with(" hook --event ") || rest.starts_with(" --data-dir ")
+        })
+    })
 }
 
 /// #515: Codex evaluates its Windows hook command with PowerShell, where a

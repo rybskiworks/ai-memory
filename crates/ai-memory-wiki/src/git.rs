@@ -150,7 +150,12 @@ impl GitAdapter {
             Some(path)
         };
         // The watcher reports git's own writes too; never stage them.
-        if rel.is_some_and(|rel| rel.starts_with(".git")) {
+        // Also ignore any path that contains a git-reserved component.
+        if rel.is_some_and(|rel| {
+            rel.components().any(|c| {
+                ai_memory_core::is_git_reserved_component(&c.as_os_str().to_string_lossy())
+            })
+        }) {
             return;
         }
         let mut written = self.written();
@@ -175,7 +180,14 @@ impl GitAdapter {
     /// Make the next path-scoped commit walk, as if the sweep were due.
     #[cfg(test)]
     pub(crate) fn age_last_walk(&self) {
-        self.written().last_walk = Instant::now().checked_sub(SWEEP_INTERVAL);
+        let mut written = self.written();
+        if let Some(aged) = Instant::now().checked_sub(SWEEP_INTERVAL) {
+            written.last_walk = Some(aged);
+        } else {
+            // A fresh Windows runner may not have ten minutes of clock history.
+            // Preserve the previous walk so the sweep still counts missed writes.
+            written.walk_needed = true;
+        }
     }
 
     /// What the sweeps found; see [`SweepSnapshot`].
@@ -614,6 +626,13 @@ fn stage_paths(
     paths: &BTreeSet<PathBuf>,
 ) -> Result<usize, git2::Error> {
     for rel in paths {
+        if rel
+            .components()
+            .any(|c| ai_memory_core::is_git_reserved_component(&c.as_os_str().to_string_lossy()))
+        {
+            warn!(path = %rel.display(), "skipping invalid git path with git-reserved component");
+            continue;
+        }
         let abs = root.join(rel);
         if abs.is_dir() {
             let spec = slash_path(rel);
@@ -1041,6 +1060,9 @@ mod tests {
         adapter.mark_written(Path::new(".git/logs/HEAD"));
         adapter.mark_written(&root.join(".git/index"));
         adapter.mark_written(Path::new(".git"));
+        adapter.mark_written(Path::new("ws/proj/.git/config"));
+        adapter.mark_written(&root.join("ws/proj/.git/hooks/pre-commit"));
+        adapter.mark_written(Path::new("ws/proj/git~1/config"));
         assert!(adapter.written_paths().is_empty());
     }
 
@@ -1131,36 +1153,44 @@ mod tests {
     }
 
     #[test]
-    fn concurrent_appends_do_not_fail_a_commit() {
+    fn concurrent_appends_do_not_fail_a_commit() -> Result<(), Box<dyn std::error::Error>> {
         let (_tmp, root, adapter) = committed(&[("ws/proj/log.md", "")]);
         let ledger = root.join("ws/proj/log.md");
-        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        // Finite writers guarantee completion even when the platform's mutex
+        // repeatedly favors an appender over the committing thread.
+        let ready = Arc::new(std::sync::Barrier::new(4));
         let writers: Vec<_> = (0..3)
             .map(|_| {
                 let adapter = adapter.clone();
                 let ledger = ledger.clone();
-                let stop = Arc::clone(&stop);
-                std::thread::spawn(move || {
-                    while !stop.load(std::sync::atomic::Ordering::Relaxed) {
-                        adapter
-                            .append(&ledger, b"2026-09-08T00:00:00Z stop x\n")
-                            .unwrap();
+                let ready = Arc::clone(&ready);
+                std::thread::spawn(move || -> std::io::Result<()> {
+                    ready.wait();
+                    for _ in 0..100 {
+                        adapter.append(&ledger, b"2026-09-08T00:00:00Z stop x\n")?;
                     }
+                    Ok(())
                 })
             })
             .collect();
+        ready.wait();
         for i in 0..30 {
             std::thread::sleep(Duration::from_millis(2));
             adapter.mark_written(&ledger);
-            adapter
-                .commit_all(&format!("session {i}"))
-                .unwrap_or_else(|e| panic!("commit {i} failed: {e}"));
+            adapter.commit_all(&format!("session {i}"))?;
         }
-        stop.store(true, std::sync::atomic::Ordering::Relaxed);
         for w in writers {
-            w.join().unwrap();
+            w.join()
+                .map_err(|_| std::io::Error::other("append thread panicked"))??;
         }
+        adapter.commit_all("final concurrent append checkpoint")?;
+        let repo = Repository::open(&root)?;
+        let tree = repo.head()?.peel_to_tree()?;
+        let entry = tree.get_path(Path::new("ws/proj/log.md"))?;
+        let blob = repo.find_blob(entry.id())?;
+        assert_eq!(std::str::from_utf8(blob.content())?.lines().count(), 300);
         assert!(adapter.commit_count() >= 2);
+        Ok(())
     }
 
     /// Not a test: run by hand with `--ignored --nocapture`.
